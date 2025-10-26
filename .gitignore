@@ -30,3 +30,6 @@ MANIFEST
 # Virtual Environments
 venv/
 .venv/
+
+# Ignore PEM files (private keys, certificates)
+*.pem

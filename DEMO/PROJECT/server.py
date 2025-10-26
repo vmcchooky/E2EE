@@ -11,8 +11,8 @@ PORT = 12345        # Port để lắng nghe. Chọn một port chưa được s
 server_running = True
 
 # --- Quản lý Client ---
-clients = [] # Danh sách lưu các kết nối của client
-client_names = {} # Dictionary để lưu tên của client, key là object socket
+# Thay thế clients = [] và client_names = {} bằng:
+clients_data = {}  # Key: socket, Value: {"name": "...", "pubkey": ...}
 
 # --- Khởi tạo server socket ở phạm vi toàn cục ---
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -21,58 +21,66 @@ server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 # --- Hàm gửi tin nhắn cho tất cả client ---
 def broadcast(message, _client_socket):
-    for client_socket in clients:
-        # Gửi cho tất cả client trừ người gửi
+    # Lặp qua các key (là các socket) trong clients_data
+    for client_socket in clients_data.keys(): 
         if client_socket != _client_socket:
             try:
                 client_socket.send(message)
             except:
-                # Nếu có lỗi (ví dụ: client đã ngắt kết nối), đóng và xóa client đó đi
                 client_socket.close()
-                # Dùng list comprehension để xóa client một cách an toàn
-                clients[:] = [c for c in clients if c != client_socket]
+                # Xóa client nếu không gửi được
+                if client_socket in clients_data:
+                     del clients_data[client_socket]
 
 
 # --- Hàm xử lý cho từng client ---
 def handle_client(client_socket):
-    try:
-        # Yêu cầu client nhập tên
-        client_socket.send("NAME".encode('utf-8'))
-        name = client_socket.recv(1024).decode('utf-8')
-        
-        # Nếu client ngắt kết nối ngay khi được hỏi tên
-        if not name:
-            return
+    # Bên trong hàm handle_client(client_socket)
 
-        client_names[client_socket] = name
-        clients.append(client_socket)
-        print(f"{name} đã tham gia phòng chat!")
-        broadcast(f"{name} đã tham gia phòng chat!".encode('utf-8'), client_socket)
+    # 1. Yêu cầu client nhập tên (giữ nguyên)
+    client_socket.send("NAME".encode('utf-8'))
+    name = client_socket.recv(1024).decode('utf-8')
 
-        # Thay vòng lặp vô tận bằng vòng lặp có điều kiện
-        while server_running:
-            try:
-                # Nhận tin nhắn từ client
-                message = client_socket.recv(1024)
-                if message:
-                    # Gửi tin nhắn này cho tất cả các client khác
-                    broadcast_message = f"<{name}> {message.decode('utf-8')}".encode('utf-8')
-                    print(broadcast_message.decode('utf-8'))
-                    broadcast(broadcast_message, client_socket)
-                else:
-                    # Nếu không nhận được message, client đã ngắt kết nối
-                    break
-            except:
-                break
-    finally:
-        # Xử lý khi client ngắt kết nối (dù vì lý do gì)
-        if client_socket in clients:
-            clients.remove(client_socket)
-            name = client_names.pop(client_socket, 'Ai đó') # Lấy tên và xóa khỏi dictionary
+    # 2. Yêu cầu và nhận Public Key (Logic mới)
+    client_socket.send("PUBKEY_REQ".encode('utf-8'))
+    # Public key có thể lớn, nhận 2048 bytes cho an toàn
+    pubkey_bytes = client_socket.recv(2048) 
+
+    # 3. Lưu trữ thông tin client
+    clients_data[client_socket] = {
+        "name": name,
+        "pubkey": pubkey_bytes  # Lưu dạng bytes
+    }
+
+    print(f"{name} đã kết nối và gửi public key.")
+    print(f"Hiện có {len(clients_data)} người dùng đang kết nối.")
+
+    # Thông báo cho người khác (giữ nguyên)
+    broadcast(f"{name} đã tham gia phòng chat!".encode('utf-8'), client_socket)
+
+    # 4. Vòng lặp nhận tin nhắn (thay đổi nhỏ)
+    while True:
+        try:
+            message = client_socket.recv(1024)
+            if message:
+                # Lấy tên từ cấu trúc data mới
+                sender_name = clients_data[client_socket]["name"]
+                broadcast_message = f"<{sender_name}> {message.decode('utf-8')}".encode('utf-8')
+                print(broadcast_message.decode('utf-8'))
+                broadcast(broadcast_message, client_socket)
+            else:
+                raise ConnectionResetError
+        except:
+            # Xử lý khi client ngắt kết nối (thay đổi nhỏ)
+            name = clients_data[client_socket]["name"]
             print(f"{name} đã rời phòng chat.")
+
+            # Xóa client khỏi cấu trúc data
+            del clients_data[client_socket] 
+
             broadcast(f"{name} đã rời phòng chat.".encode('utf-8'), client_socket)
             client_socket.close()
-
+            break
 
 # --- Hàm chính để khởi động Server ---
 def start_server():
