@@ -55,8 +55,19 @@ def handle_client(client_socket: socket.socket) -> None:
             if not message:
                 raise ConnectionResetError
 
-            decoded_msg = message.decode('utf-8')
+            decoded_msg = message.decode('utf-8').strip()
             sender_name = clients_data[client_socket]["name"]
+
+            if decoded_msg.lower() in {"quit", "exit"}:
+                print(f"{sender_name} yeu cau ngat ket noi.")
+                clients_data.pop(client_socket, None)
+                broadcast(f"{sender_name} da roi phong chat.\n".encode('utf-8'), client_socket)
+                try:
+                    client_socket.send("BYE\n".encode('utf-8'))
+                except Exception:  # noqa: BLE001
+                    pass
+                client_socket.close()
+                break
 
             if decoded_msg.startswith("PRIVATE_MSG:"):
                 try:

@@ -1,175 +1,205 @@
-
-
-import os  # Để kiểm tra file tồn tại
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
-
-# client.py
+﻿import os
 import socket
 import threading
 import sys
+import base64
 
-# --- Hàm để nhận tin nhắn từ Server ---
-# Hàm này sẽ chạy trên một luồng (thread) riêng
-def receive_messages(client_socket):
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from crypto_utils import (
+    aes_decrypt,
+    aes_encrypt,
+    generate_aes_key,
+    load_public_key_from_bytes,
+    rsa_decrypt,
+    rsa_encrypt,
+    generate_or_load_keys
+)
+
+my_name = ""
+my_private_key = None  # store private key object
+user_directory = {}   # {"Alice": <public_key_obj>}
+session_keys = {}     # {"Alice": <aes_key_bytes>}
+
+
+def receive_messages(client_socket: socket.socket) -> None:
+    """Listen for incoming messages from server on a background thread."""
+    buffer = ""
     while True:
         try:
-            # Nhận tin nhắn từ server
-            message = client_socket.recv(1024).decode('utf-8')
-            
-            # Nếu không nhận được gì (server sập), thoát vòng lặp
-            if not message:
-                print("Mất kết nối với server.")
+            data = client_socket.recv(2048).decode("utf-8")
+            if not data:
+                print("Mat ket noi voi server.")
                 break
-                
-            # In tin nhắn nhận được ra màn hình
-            print(message)
-        except Exception as e:
-            # Xảy ra lỗi (ví dụ: client tự ngắt kết nối)
-            print(f"Đã xảy ra lỗi: {e}")
+
+            buffer += data
+
+            while "\n" in buffer:
+                message, buffer = buffer.split("\n", 1)
+                if not message:
+                    continue
+
+                if message.startswith("NEW_USER:"):
+                    _, name, pubkey_b64 = message.split(":", 2)
+                    if name != my_name:
+                        pubkey_bytes = base64.b64decode(pubkey_b64)
+                        user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+                        print(f"[HE THONG] {name} vua tham gia. San sang ket noi E2EE.")
+
+                elif message.startswith("SESSION_OFFER:"):
+                    _, sender_name, encrypted_key_b64 = message.split(":", 2)
+                    encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
+                    aes_key = rsa_decrypt(encrypted_key_bytes, my_private_key)
+                    session_keys[sender_name] = aes_key
+                    print(f"[HE THONG] Da thiet lap phien E2EE voi {sender_name}.")
+
+                elif message.startswith("<"):
+                    print(message)
+
+                elif message.startswith("PRIVATE_MSG:"):
+                    try:
+                        _, sender_name, encrypted_content_b64 = message.split(":", 2)
+                        if sender_name in session_keys:
+                            session_key = session_keys[sender_name]
+                            encrypted_bytes = base64.b64decode(encrypted_content_b64)
+                            decrypted_text = aes_decrypt(encrypted_bytes, session_key)
+                            if decrypted_text:
+                                print(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
+                            else:
+                                print(f"[LOI] Khong the giai ma tin nhan tu {sender_name}.")
+                        else:
+                            print(f"[INFO] Nhan tin nhan ma hoa tu {sender_name} nhung chua co khoa. Hay go /connect {sender_name}")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"Loi xu ly tin nhan rieng: {e}")
+
+                else:
+                    print(message)
+        except Exception as e:  # noqa: BLE001
+            print(f"Loi khi nhan tin nhan: {e}")
             client_socket.close()
             break
 
+def start_client() -> None:
+    HOST = '127.0.0.1'
+    PORT = 12345
 
-def generate_or_load_keys(name):
-    """Tạo cặp khóa RSA mới nếu chưa tồn tại, hoặc nạp khóa từ file nếu đã có."""
-    private_key_file = f"private_key_{name}.pem"
-    public_key_file = f"public_key_{name}.pem"
-
-    private_key = None
-    public_key = None
-
-    try:
-        # Nếu file đã tồn tại -> Nạp khóa
-        if os.path.exists(private_key_file):
-            print("Đang nạp khóa cá nhân...")
-            with open(private_key_file, "rb") as f:
-                private_key = serialization.load_pem_private_key(
-                    f.read(),
-                    password=None  # Dự án này không đặt mật khẩu cho file key
-                )
-
-            with open(public_key_file, "rb") as f:
-                public_key_bytes = f.read() # Nạp public key dạng bytes để gửi đi
-                public_key = serialization.load_pem_public_key(public_key_bytes)
-
-            print("Nạp khóa thành công.")
-
-        # Nếu file không tồn tại -> Tạo khóa mới
-        else:
-            print("Đang tạo cặp khóa RSA mới (việc này có thể mất vài giây)...")
-            # 1. Tạo private key
-            private_key = rsa.generate_private_key(
-                public_exponent=65537,
-                key_size=2048,  # Kích thước khóa 2048-bit là an toàn
-            )
-
-            # 2. Lấy public key từ private key
-            public_key = private_key.public_key()
-
-            # 3. Lưu private key xuống file
-            with open(private_key_file, "wb") as f:
-                f.write(private_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption()
-                ))
-
-            # 4. Lưu public key xuống file
-            public_key_bytes = public_key.public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                )
-            with open(public_key_file, "wb") as f:
-                f.write(public_key_bytes)
-
-            print(f"Đã tạo và lưu khóa vào {private_key_file} và {public_key_file}.")
-
-        return private_key, public_key_bytes # Trả về private key (object) và public key (bytes)
-
-    except Exception as e:
-        print(f"Lỗi khi xử lý khóa: {e}")
-        return None, None
-
-# --- Hàm chính để bắt đầu Client ---
-def start_client():
-    # --- Cấu hình Client ---
-    # Phải khớp với cấu hình của server.py
-    HOST = '127.0.0.1' 
-    PORT = 12345       
-
-    # 1. Tạo socket và kết nối đến Server
     try:
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client_socket.connect((HOST, PORT))
     except ConnectionRefusedError:
-        print("Không thể kết nối đến server. Server có đang chạy không?")
+        print("Khong the ket noi den server. Server co dang chay khong?")
         return
 
-    # 2. Xử lý yêu cầu nhập tên từ Server
     try:
         message = client_socket.recv(1024).decode('utf-8')
         name = ""
         if message == "NAME":
-            name = input("Nhập tên của bạn: ")
+            name = input("Nhap ten cua ban: ")
             client_socket.send(name.encode('utf-8'))
+            global my_name
+            my_name = name
         else:
-            print("Server không yêu cầu tên.")
-            return # Thoát nếu server không hỏi tên
-
-        # 3. TẠO HOẶC NẠP KHÓA (Logic mới)
-        private_key, public_key_bytes = generate_or_load_keys(name)
-        if not private_key:
-            print("Không thể xử lý khóa. Đang thoát...")
+            print("Server khong yeu cau ten.")
             client_socket.close()
             return
 
-        # 4. Chờ Server yêu cầu và GỬI PUBLIC KEY (Logic mới)
-        message = client_socket.recv(1024).decode('utf-8')
-        if message == "PUBKEY_REQ":
-            print("Server yêu cầu public key. Đang gửi...")
-            client_socket.sendall(public_key_bytes) # Dùng sendall để đảm bảo gửi hết
-        else:
-            print("Server không yêu cầu public key.")
+        private_key, public_key_bytes = generate_or_load_keys(name)
+        global my_private_key
+        my_private_key = private_key
+        if not private_key:
+            print("Khong the xu ly khoa. Dang thoat...")
+            client_socket.close()
             return
 
-    except Exception as e:
-        print(f"Lỗi trong quá trình thiết lập kết nối: {e}")
+        message = client_socket.recv(1024).decode('utf-8')
+        if message == "PUBKEY_REQ":
+            print("Server yeu cau public key. Dang gui...")
+            client_socket.sendall(public_key_bytes)
+        else:
+            print("Server khong yeu cau public key.")
+            client_socket.close()
+            return
+
+    except Exception as e:  # noqa: BLE001
+        print(f"Loi trong qua trinh thiet lap ket noi: {e}")
         client_socket.close()
         return
 
-    # 5. Tạo và khởi động luồng nhận tin nhắn
     receive_thread = threading.Thread(target=receive_messages, args=(client_socket,))
-    receive_thread.daemon = True  # Đặt là daemon để thread tự tắt khi chương trình chính tắt
+    receive_thread.daemon = True
     receive_thread.start()
 
-    # 6. Vòng lặp gửi tin nhắn (chạy trên luồng chính)
-    print("Đã kết nối. Gõ tin nhắn của bạn và nhấn Enter để gửi.")
-    print("Gõ '/quit' để thoát.")
+    print("Da ket noi. Go tin nhan va nhan Enter de gui.")
+    print("Go '/quit' de thoat.")
 
     try:
         while True:
-            # Chờ người dùng nhập tin nhắn
             message = input()
-            
+
             if message.lower() == '/quit':
                 break
-                
-            # Gửi tin nhắn đến server
-            if message: # Chỉ gửi nếu tin nhắn không rỗng
+
+            elif message.startswith("/connect "):
+                target_name = message.split(" ", 1)[1]
+
+                if target_name == my_name:
+                    print("[LOI] Ban khong the ket noi voi chinh minh.")
+                    continue
+                if target_name not in user_directory:
+                    print(f"[LOI] Khong tim thay nguoi dung: {target_name}.")
+                    continue
+                if target_name in session_keys:
+                    print(f"[INFO] Ban da co phien E2EE voi {target_name}.")
+                    continue
+
+                target_pubkey_obj = user_directory[target_name]
+                aes_key = generate_aes_key()
+                encrypted_aes_key = rsa_encrypt(aes_key, target_pubkey_obj)
+                session_keys[target_name] = aes_key
+
+                encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
+                offer_message = f"SESSION_OFFER:{target_name}:{my_name}:{encrypted_key_b64}\n"
+                client_socket.sendall(offer_message.encode('utf-8'))
+                print(f"[HE THONG] Da gui loi moi E2EE den {target_name}.")
+
+            elif message.startswith("/chat "):
+                try:
+                    parts = message.split(" ", 2)
+                    if len(parts) < 3:
+                        print("Cu phap: /chat <ten nguoi nhan> <noi dung>")
+                        continue
+
+                    target_name = parts[1]
+                    plain_content = parts[2]
+
+                    if target_name not in session_keys:
+                        print(f"[LOI] Chua co ket noi bao mat voi {target_name}. Hay dung /connect {target_name} truoc.")
+                        continue
+
+                    session_key = session_keys[target_name]
+                    encrypted_bytes = aes_encrypt(plain_content.encode('utf-8'), session_key)
+                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
+
+                    final_msg = f"PRIVATE_MSG:{target_name}:{encrypted_b64}\n"
+                    client_socket.send(final_msg.encode('utf-8'))
+
+                    print(f"[DA GUI] toi {target_name}: {plain_content}")
+
+                except Exception as e:  # noqa: BLE001
+                    print(f"Loi khi gui tin nhan: {e}")
+            else:
                 client_socket.send(message.encode('utf-8'))
-                
+
     except KeyboardInterrupt:
-        print("\nĐang thoát...")
+        print("\nDang thoat...")
     finally:
-        # Dọn dẹp và đóng kết nối
         client_socket.close()
-        print("Đã ngắt kết nối khỏi server.")
+        print("Da ngat ket noi khoi server.")
         sys.exit(0)
 
 
-# --- Chạy Client ---
 if __name__ == "__main__":
     start_client()
