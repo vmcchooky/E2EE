@@ -72,6 +72,7 @@ class ChatApp(ctk.CTk):
         
         # Biến chọn người đang chat
         self.current_chat_partner = "Broadcast" # Mặc định chat chung
+        self.user_buttons = {} # [FIX] Thêm dictionary để quản lý nút bấm
 
     def connect_server_dialog(self):
         dialog = ctk.CTkInputDialog(text="Nhập tên của bạn:", title="Đăng nhập")
@@ -150,9 +151,14 @@ class ChatApp(ctk.CTk):
                 aes_key = rsa_decrypt(encrypted_key_bytes, self.my_private_key)
                 self.session_keys[sender_name] = aes_key
                 self.display_message(f"[SECURE] Đã thiết lập khóa E2EE với {sender_name}.")
-            except Exception as e:  # noqa: BLE001
+                
+                # [UX UPDATE] Nếu đang mở cửa sổ chat với người này, cập nhật label
+                if self.current_chat_partner == sender_name:
+                    self.logo_label.configure(text=f"Chat với: {sender_name} (🔒)", text_color="green")
+                    
+            except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý SESSION_OFFER: {e}")
-
+                
         elif message.startswith("PRIVATE_MSG:"):
             try:
                 _, sender_name, encrypted_content_b64 = message.split(":", 2)
@@ -201,25 +207,31 @@ class ChatApp(ctk.CTk):
 
         self.entry_message.delete(0, "end")
     
+    # [FIX] Sửa lại hàm thêm nút user
     def add_user_button(self, name):
-        # Tạo nút bấm cho user mới
+        if name in self.user_buttons:
+            return # Đã có nút này rồi thì bỏ qua
+
         btn = ctk.CTkButton(
             self.scrollable_user_list, 
             text=name,
             command=lambda n=name: self.select_chat_partner(n)
         )
         btn.pack(pady=5, padx=5, fill="x")
+        self.user_buttons[name] = btn # Lưu lại nút
 
+    # [FIX] Cập nhật hàm chọn chat partner
     def select_chat_partner(self, name):
         self.current_chat_partner = name
-        self.logo_label.configure(text=f"Chat với: {name}")
-        self.display_message(f"--- Đã chuyển sang chế độ chat với {name} ---")
         
-        # Nếu chưa có khóa, tự động bắt tay
         if name not in self.session_keys:
+            self.logo_label.configure(text=f"Đang kết nối: {name}...", text_color="orange")
             self.display_message(f"[SYSTEM] Đang thiết lập mã hóa E2EE với {name}...")
-            self.perform_handshake(name) # Hàm này chứa logic /connect cũ
-
+            self.perform_handshake(name)
+        else:
+            self.logo_label.configure(text=f"Chat với: {name} (🔒)", text_color="green")
+            self.display_message(f"--- Đã chuyển sang chế độ chat an toàn với {name} ---")
+            
     def perform_handshake(self, target_name):
         """Tạo AES key, mã hóa bằng RSA của target và gửi SESSION_OFFER."""
         if target_name == self.username:

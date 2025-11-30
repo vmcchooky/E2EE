@@ -24,34 +24,50 @@ def broadcast(message: bytes, _client_socket: socket.socket) -> None:
 
 
 def handle_client(client_socket: socket.socket) -> None:
-    client_socket.send("NAME".encode('utf-8'))
-    name = client_socket.recv(1024).decode('utf-8')
+    try:
+        # 1. Nhận và kiểm tra tên
+        client_socket.send("NAME".encode('utf-8'))
+        name = client_socket.recv(1024).decode('utf-8').strip()
 
-    client_socket.send("PUBKEY_REQ".encode('utf-8'))
-    pubkey_bytes = client_socket.recv(2048)
+        # [FIX] Kiểm tra trùng tên
+        if any(info['name'] == name for info in clients_data.values()):
+            print(f"[REJECT] Tu choi ket noi: Ten '{name}' da ton tai.")
+            client_socket.send("[ERROR] Ten da duoc su dung. Vui long chon ten khac.\n".encode('utf-8'))
+            client_socket.close()
+            return
 
-    print(f"Dang xu ly ket noi cho {name}...")
+        # [FIX] Cấm ký tự đặc biệt (để tránh lỗi split sau này)
+        if ":" in name or " " in name:
+             client_socket.send("[ERROR] Ten khong duoc chua khoang trang hoac dau hai cham (:).\n".encode('utf-8'))
+             client_socket.close()
+             return
 
-    for existing_socket, info in clients_data.items():
-        existing_name = info["name"]
-        existing_pubkey_b64 = base64.b64encode(info["pubkey"]).decode('utf-8')
-        message = f"NEW_USER:{existing_name}:{existing_pubkey_b64}\n"
-        client_socket.send(message.encode('utf-8'))
+        client_socket.send("PUBKEY_REQ".encode('utf-8'))
+        pubkey_bytes = client_socket.recv(2048)
 
-    clients_data[client_socket] = {
-        "name": name,
-        "pubkey": pubkey_bytes
-    }
+        print(f"Dang xu ly ket noi cho {name}...")
 
-    print(f"{name} da ket noi va gui public key.")
+        # Gửi danh sách user cũ cho user mới
+        for existing_socket, info in clients_data.items():
+            existing_name = info["name"]
+            existing_pubkey_b64 = base64.b64encode(info["pubkey"]).decode('utf-8')
+            message = f"NEW_USER:{existing_name}:{existing_pubkey_b64}\n"
+            client_socket.send(message.encode('utf-8'))
 
-    new_user_pubkey_b64 = base64.b64encode(pubkey_bytes).decode('utf-8')
-    broadcast_message = f"NEW_USER:{name}:{new_user_pubkey_b64}\n".encode('utf-8')
-    broadcast(broadcast_message, client_socket)
+        clients_data[client_socket] = {
+            "name": name,
+            "pubkey": pubkey_bytes
+        }
 
-    while True:
-        try:
-            message = client_socket.recv(1024)
+        print(f"{name} da ket noi va gui public key.")
+
+        # Broadcast user mới
+        new_user_pubkey_b64 = base64.b64encode(pubkey_bytes).decode('utf-8')
+        broadcast_message = f"NEW_USER:{name}:{new_user_pubkey_b64}\n".encode('utf-8')
+        broadcast(broadcast_message, client_socket)
+
+        while True:
+            message = client_socket.recv(4096) # Tăng buffer lên xíu đề phòng key dài
             if not message:
                 raise ConnectionResetError
 
@@ -59,57 +75,49 @@ def handle_client(client_socket: socket.socket) -> None:
             sender_name = clients_data[client_socket]["name"]
 
             if decoded_msg.lower() in {"quit", "exit"}:
-                print(f"{sender_name} yeu cau ngat ket noi.")
-                clients_data.pop(client_socket, None)
-                broadcast(f"{sender_name} da roi phong chat.\n".encode('utf-8'), client_socket)
-                try:
-                    client_socket.send("BYE\n".encode('utf-8'))
-                except Exception:  # noqa: BLE001
-                    pass
-                client_socket.close()
-                break
+                raise ConnectionResetError # Nhảy xuống except để xử lý thoát
 
+            # --- XỬ LÝ TIN NHẮN ---
             if decoded_msg.startswith("PRIVATE_MSG:"):
-                try:
-                    _, target_name, content = decoded_msg.split(":", 2)
-                    print(f"[SERVER] PRIVATE_MSG {sender_name} -> {target_name}: {content}")
+                parts = decoded_msg.split(":", 2)
+                if len(parts) == 3:
+                    _, target_name, content = parts
                     target_socket = next((s for s, info in clients_data.items() if info["name"] == target_name), None)
                     if target_socket:
                         fwd_msg = f"PRIVATE_MSG:{sender_name}:{content}\n".encode('utf-8')
                         target_socket.send(fwd_msg)
                     else:
-                        err_msg = f"[SERVER] Nguoi dung {target_name} khong ton tai.\n"
+                        # [FIX] Thông báo lỗi rõ ràng hơn
+                        err_msg = f"[SYSTEM] Nguoi dung '{target_name}' khong online.\n"
                         client_socket.send(err_msg.encode('utf-8'))
-                except ValueError:
-                    print(f"Loi dinh dang PRIVATE_MSG tu {sender_name}")
 
             elif decoded_msg.startswith("SESSION_OFFER:"):
-                try:
-                    _, target_name, sender_name_in_offer, content_b64 = decoded_msg.split(":", 3)
-                except ValueError:
-                    print(f"Loi dinh dang SESSION_OFFER tu {sender_name}")
-                    continue
-
-                target_socket = next((s for s, info in clients_data.items() if info["name"] == target_name), None)
-                if target_socket:
-                    fwd = f"SESSION_OFFER:{sender_name_in_offer}:{content_b64}\n".encode('utf-8')
-                    target_socket.send(fwd)
+                # [FIX] Xử lý split an toàn hơn
+                parts = decoded_msg.split(":", 3)
+                if len(parts) == 4:
+                    _, target_name, sender_name_in_offer, content_b64 = parts
+                    target_socket = next((s for s, info in clients_data.items() if info["name"] == target_name), None)
+                    if target_socket:
+                        fwd = f"SESSION_OFFER:{sender_name_in_offer}:{content_b64}\n".encode('utf-8')
+                        target_socket.send(fwd)
+                    else:
+                        client_socket.send(f"[SYSTEM] '{target_name}' khong con online.\n".encode('utf-8'))
                 else:
-                    err_msg = f"[SERVER] Nguoi dung {target_name} khong ton tai.\n"
-                    client_socket.send(err_msg.encode('utf-8'))
+                    print(f"[WARNING] Malformed SESSION_OFFER from {sender_name}")
 
             else:
-                print(f"[SERVER] BROADCAST {sender_name}: {decoded_msg.strip()}")
+                # Chat Broadcast
                 broadcast_message = f"<{sender_name}> {decoded_msg}\n".encode('utf-8')
                 broadcast(broadcast_message, client_socket)
 
-        except Exception:  # noqa: BLE001
-            name = clients_data.get(client_socket, {}).get("name", "?")
-            print(f"{name} da roi phong chat.")
-            clients_data.pop(client_socket, None)
-            broadcast(f"{name} da roi phong chat.\n".encode('utf-8'), client_socket)
-            client_socket.close()
-            break
+    except Exception as e:
+        # Xử lý ngắt kết nối chung
+        if client_socket in clients_data:
+            name = clients_data[client_socket]["name"]
+            print(f"{name} da ngat ket noi ({e}).")
+            del clients_data[client_socket]
+            broadcast(f"[SYSTEM] {name} da roi phong chat.\n".encode('utf-8'), None)
+        client_socket.close()
 
 
 def start_server() -> None:
