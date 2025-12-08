@@ -49,6 +49,12 @@ def receive_messages(client_socket: socket.socket) -> None:
                         user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
                         print(f"[HE THONG] {name} vua tham gia. San sang ket noi E2EE.")
 
+                                # SERVER gửi về:
+                #   SESSION_OFFER:<sender_name_thực>:<encrypted_key_b64>
+                # => Ở phía client chỉ cần:
+                #   - Lấy sender_name để lưu session_keys[sender_name]
+                #   - Giải mã encrypted_key_b64 bằng private_key của chính mình.
+
                 elif message.startswith("SESSION_OFFER:"):
                     _, sender_name, encrypted_key_b64 = message.split(":", 2)
                     encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
@@ -114,12 +120,20 @@ def start_client() -> None:
             client_socket.close()
             return
 
-        message = client_socket.recv(1024).decode('utf-8')
-        if message == "PUBKEY_REQ":
-            print("Server yeu cau public key. Dang gui...")
+        msg = client_socket.recv(1024).decode('utf-8')
+
+        # Nếu server trả về lỗi
+        if msg.startswith("[ERROR]"):
+            print(msg.strip())
+            client_socket.close()
+            return
+
+        # Nếu server yêu cầu public key
+        if msg == "PUBKEY_REQ":
             client_socket.sendall(public_key_bytes)
+            print("[SYSTEM] Đã kết nối thành công!")
         else:
-            print("Server khong yeu cau public key.")
+            print(f"[ERROR] Handshake thất bại: {msg}")
             client_socket.close()
             return
 
@@ -181,6 +195,9 @@ def start_client() -> None:
 
                     session_key = session_keys[target_name]
                     encrypted_bytes = aes_encrypt(plain_content.encode('utf-8'), session_key)
+                    if encrypted_bytes is None:
+                        print("[LOI] Ma hoa that bai, khong gui tin nhan.")
+                        continue
                     encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
 
                     final_msg = f"PRIVATE_MSG:{target_name}:{encrypted_b64}\n"
@@ -191,7 +208,7 @@ def start_client() -> None:
                 except Exception as e:  # noqa: BLE001
                     print(f"Loi khi gui tin nhan: {e}")
             else:
-                client_socket.send(message.encode('utf-8'))
+                client_socket.send((message + "\n").encode('utf-8'))
 
     except KeyboardInterrupt:
         print("\nDang thoat...")

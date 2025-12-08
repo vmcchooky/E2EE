@@ -42,7 +42,14 @@ class ChatApp(ctk.CTk):
         # Nơi chứa các nút bấm chọn người chat
         self.scrollable_user_list = ctk.CTkScrollableFrame(self.sidebar_frame, label_text="Online Users")
         self.scrollable_user_list.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
-        
+                # Nút cố định để quay lại chat chung (Broadcast)
+        self.broadcast_button = ctk.CTkButton(
+            self.scrollable_user_list,
+            text="Broadcast (All)",
+            command=self.select_broadcast  # gọi hàm riêng, KHÔNG handshake
+        )
+        self.broadcast_button.pack(pady=5, padx=5, fill="x")
+
         # Nút kết nối thủ công (tạm thời)
         self.connect_btn = ctk.CTkButton(self.sidebar_frame, text="Connect Server", command=self.connect_server_dialog)
         self.connect_btn.grid(row=2, column=0, padx=20, pady=10)
@@ -99,14 +106,22 @@ class ChatApp(ctk.CTk):
             # Nhận yêu cầu tên
             msg = self.client_socket.recv(1024).decode('utf-8')
             if msg == "NAME":
-                self.client_socket.send(name.encode('utf-8'))
+                self.client_socket.send((name + "\n").encode('utf-8'))
             
-            # Nhận yêu cầu PubKey
             msg = self.client_socket.recv(1024).decode('utf-8')
+            if msg.startswith("[ERROR]"):
+                self.display_message(msg.strip())
+                self.client_socket.close()
+                return
+
             if msg == "PUBKEY_REQ":
                 self.client_socket.sendall(public_key_bytes)
-            
-            self.display_message("[SYSTEM] Đã kết nối thành công!")
+                self.display_message("[SYSTEM] Đã kết nối thành công!")
+            else:
+                self.display_message(f"[ERROR] Handshake thất bại: {msg}")
+                self.client_socket.close()
+                return
+
             
             # Bắt đầu lắng nghe tin nhắn
             self.receive_messages()
@@ -144,6 +159,11 @@ class ChatApp(ctk.CTk):
                 self.display_message(f"[INFO] {name} vừa online.")
                 self.add_user_button(name)
 
+        # SERVER đã chuẩn hóa format:
+        #   SESSION_OFFER:<sender_name_thực>:<encrypted_key_b64>
+        # nên GUI không cần quan tâm client khác gửi gì lên server,
+        # chỉ cần tin sender_name và content từ server.
+
         elif message.startswith("SESSION_OFFER:"):
             try:
                 _, sender_name, encrypted_key_b64 = message.split(":", 2)
@@ -177,6 +197,9 @@ class ChatApp(ctk.CTk):
 
         elif message.startswith("<"): # Chat thường
             self.display_message(message)
+        
+        else:
+            self.display_message(f"[UNKNOWN] {message}")
             
     def send_message_event(self):
         msg = self.entry_message.get()
@@ -185,15 +208,20 @@ class ChatApp(ctk.CTk):
         target = self.current_chat_partner
         
         if target == "Broadcast":
-            # Gửi thường
-            self.client_socket.send((msg + "\n").encode('utf-8'))
-            self.display_message(f"Me (All): {msg}")
+            # Gửi tin nhắn công khai
+            try:
+                self.client_socket.send((msg + "\n").encode("utf-8"))
+            except Exception as e:  # noqa: BLE001
+                self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn broadcast: {e}")
         else:
             # Gửi mã hóa (Logic Tuần 6)
             if target in self.session_keys:
                 try:
                     session_key = self.session_keys[target]
                     encrypted_bytes = aes_encrypt(msg.encode('utf-8'), session_key)
+                    if encrypted_bytes is None:
+                        self.display_message("[ERROR] Mã hóa thất bại, không gửi tin nhắn.")
+                        return
                     encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
                     final_msg = f"PRIVATE_MSG:{target}:{encrypted_b64}\n"
                     self.client_socket.send(final_msg.encode('utf-8'))
@@ -231,7 +259,14 @@ class ChatApp(ctk.CTk):
         else:
             self.logo_label.configure(text=f"Chat với: {name} (🔒)", text_color="green")
             self.display_message(f"--- Đã chuyển sang chế độ chat an toàn với {name} ---")
-            
+     
+    def select_broadcast(self):
+        """Chuyển về phòng chat chung (Broadcast), không mã hóa E2EE."""
+        self.current_chat_partner = "Broadcast"
+        # Cập nhật tiêu đề bên trái cho dễ nhìn
+        self.logo_label.configure(text="DANH BẠ - Chat chung", text_color="white")
+        self.display_message("--- Đã chuyển sang phòng chat chung (Broadcast) ---")
+               
     def perform_handshake(self, target_name):
         """Tạo AES key, mã hóa bằng RSA của target và gửi SESSION_OFFER."""
         if target_name == self.username:
@@ -257,11 +292,18 @@ class ChatApp(ctk.CTk):
         except Exception as e:  # noqa: BLE001
             self.display_message(f"[ERROR] Lỗi khi bắt tay với {target_name}: {e}")
       
+    # Trong client_gui.py -> class ChatApp
+
     def display_message(self, text):
+        # Dùng self.after để đẩy việc cập nhật UI về luồng chính
+        self.after(0, self._safe_display_message, text)
+
+    def _safe_display_message(self, text):
+        """Hàm nội bộ thực sự thực hiện việc in tin nhắn"""
         self.chat_display.configure(state="normal")
         self.chat_display.insert("end", text + "\n")
         self.chat_display.configure(state="disabled")
-        self.chat_display.see("end") # Tự động cuộn xuống cuối
+        self.chat_display.see("end")
 
 if __name__ == "__main__":
     app = ChatApp()
