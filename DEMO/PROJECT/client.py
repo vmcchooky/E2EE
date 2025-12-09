@@ -3,6 +3,7 @@ import socket
 import threading
 import sys
 import base64
+import getpass
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
@@ -111,12 +112,32 @@ def start_client() -> None:
             print("Server khong yeu cau ten.")
             client_socket.close()
             return
+        
+        # --- Hỏi password bảo vệ private key ---
+        private_key_file = f"private_key_{name}.pem"
 
-        private_key, public_key_bytes = generate_or_load_keys(name)
+        if os.path.exists(private_key_file):
+            # Đã có khóa -> yêu cầu nhập password để mở
+            pwd = getpass.getpass("Nhap mat khau de mo private key: ")
+        else:
+            # Chưa có -> tạo mật khẩu mới
+            while True:
+                pwd1 = getpass.getpass("Tao mat khau moi de bao ve private key: ")
+                pwd2 = getpass.getpass("Nhap lai mat khau: ")
+                if pwd1 != pwd2:
+                    print("Mat khau khong khop, vui long thu lai.")
+                    continue
+                if not pwd1:
+                    print("Mat khau khong duoc rong.")
+                    continue
+                pwd = pwd1
+                break
+
+        private_key, public_key_bytes = generate_or_load_keys(name, pwd)
         global my_private_key
         my_private_key = private_key
         if not private_key:
-            print("Khong the xu ly khoa. Dang thoat...")
+            print("Khong the xu ly khoa (co the sai mat khau). Dang thoat...")
             client_socket.close()
             return
 

@@ -84,16 +84,31 @@ class ChatApp(ctk.CTk):
     def connect_server_dialog(self):
         dialog = ctk.CTkInputDialog(text="Nhập tên của bạn:", title="Đăng nhập")
         name = dialog.get_input()
-        if name:
-            self.username = name
-            self.title(f"Secure Chat - {self.username}")
-            
-            # 1. Logic tạo/nạp khóa RSA
-            self.my_private_key, public_key_bytes = generate_or_load_keys(name)
-            
-            # 2. Kết nối Socket (Chạy ngầm)
-            threading.Thread(target=self.start_socket, args=(name, public_key_bytes), daemon=True).start()
-            self.connect_btn.configure(state="disabled") # Không cho bấm kết nối lại
+        if not name:
+            return
+
+        # Hỏi password (tạm thời dùng InputDialog, password lộ nhưng chấp nhận cho demo)
+        pwd_dialog = ctk.CTkInputDialog(
+            text="Nhập mật khẩu bảo vệ private key (tạo mới hoặc dùng lại):",
+            title="Mật khẩu"
+        )
+        password = pwd_dialog.get_input()
+        if not password:
+            messagebox.showerror("Lỗi", "Mật khẩu không được rỗng.")
+            return
+
+        self.username = name
+        self.title(f"Secure Chat - {self.username}")
+
+        # 1. Logic tạo/nạp khóa RSA (có password)
+        self.my_private_key, public_key_bytes = generate_or_load_keys(name, password)
+        if not self.my_private_key:
+            self.display_message("[ERROR] Không thể xử lý khóa (sai mật khẩu?).")
+            return
+
+        # 2. Kết nối Socket (Chạy ngầm)
+        threading.Thread(target=self.start_socket, args=(name, public_key_bytes), daemon=True).start()
+        self.connect_btn.configure(state="disabled")
     
     def start_socket(self, name, public_key_bytes):
         HOST = '127.0.0.1'

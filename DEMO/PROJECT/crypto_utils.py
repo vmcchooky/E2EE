@@ -96,26 +96,36 @@ def aes_decrypt(encrypted_data, key):
         print(f"Lỗi giải mã GCM (có thể do sai khóa hoặc dữ liệu bị giả mạo): {e}")
         return None
     
-def generate_or_load_keys(name: str):
-    """Tao khoa RSA neu chua co, hoac nap tu file neu da ton tai."""
-    private_key_file = f"private_key_{name}.pem"
-    public_key_file = f"public_key_{name}.pem"
+def generate_or_load_keys(name: str, password: str):
+    """Tạo hoặc nạp cặp khóa RSA được bảo vệ bằng password.
+
+    - Nếu file chưa tồn tại: tạo mới, MÃ HÓA private key bằng password.
+    - Nếu file đã tồn tại: yêu cầu đúng password để giải mã.
+    """
+    private_key_file = f"Keys/Private/private_key_{name}.pem"
+    public_key_file = f"Keys/Public/public_key_{name}.pem"
 
     private_key = None
     public_key_bytes = None
 
+    if not password:
+        print("Loi: password bao ve private key khong duoc rong.")
+        return None, None
+
     try:
         if os.path.exists(private_key_file):
-            print("Dang nap khoa cu...")
+            print("Dang nap khoa cu (protected by password)...")
             with open(private_key_file, "rb") as f:
                 private_key = serialization.load_pem_private_key(
                     f.read(),
-                    password=None,
+                    password=password.encode("utf-8"),
+                    backend=default_backend()
                 )
 
             with open(public_key_file, "rb") as f:
                 public_key_bytes = f.read()
-                serialization.load_pem_public_key(public_key_bytes)
+                # Kiểm tra xem public key có hợp lệ không
+                serialization.load_pem_public_key(public_key_bytes, backend=default_backend())
 
             print("Nap khoa thanh cong.")
         else:
@@ -123,17 +133,23 @@ def generate_or_load_keys(name: str):
             private_key = rsa.generate_private_key(
                 public_exponent=65537,
                 key_size=2048,
+                backend=default_backend()
             )
-
             public_key = private_key.public_key()
 
+            # Lưu private key ĐƯỢC MÃ HÓA bằng password
             with open(private_key_file, "wb") as f:
-                f.write(private_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption()
-                ))
+                f.write(
+                    private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.BestAvailableEncryption(
+                            password.encode("utf-8")
+                        ),
+                    )
+                )
 
+            # Lưu public key như cũ
             public_key_bytes = public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
@@ -146,6 +162,6 @@ def generate_or_load_keys(name: str):
         return private_key, public_key_bytes
 
     except Exception as e:  # noqa: BLE001
-        print(f"Loi khi xu ly khoa: {e}")
+        print(f"Loi khi xu ly khoa (co the do sai password): {e}")
         return None, None
 # END OF FILE
