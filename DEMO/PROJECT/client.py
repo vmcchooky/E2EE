@@ -17,14 +17,41 @@ from crypto_utils import (
     load_public_key_from_bytes,
     rsa_decrypt,
     rsa_encrypt,
-    generate_or_load_keys
+    generate_or_load_keys,
+    public_key_fingerprint,
 )
+
+import json
+
+KNOWN_KEYS_FILE = "FingerPrint/known_keys.json"
+known_keys = {}   # {"Alice": "abcd1234..."}
+
 
 my_name = ""
 my_private_key = None  # store private key object
 user_directory = {}   # {"Alice": <public_key_obj>}
 session_keys = {}     # {"Alice": <aes_key_bytes>}
 
+def load_known_keys():
+    """Nạp danh sách fingerprint đã lưu (TOFU)."""
+    global known_keys
+    if os.path.exists(KNOWN_KEYS_FILE):
+        try:
+            with open(KNOWN_KEYS_FILE, "r", encoding="utf-8") as f:
+                known_keys = json.load(f)
+        except Exception:
+            known_keys = {}
+    else:
+        known_keys = {}
+
+def save_known_keys():
+    """Lưu danh sách fingerprint ra file."""
+    try:
+        os.makedirs(os.path.dirname(KNOWN_KEYS_FILE), exist_ok=True)
+        with open(KNOWN_KEYS_FILE, "w", encoding="utf-8") as f:
+            json.dump(known_keys, f, indent=2)
+    except Exception as e:
+        print(f"Loi khi luu known_keys: {e}")
 
 def receive_messages(client_socket: socket.socket) -> None:
     """Listen for incoming messages from server on a background thread."""
@@ -47,10 +74,33 @@ def receive_messages(client_socket: socket.socket) -> None:
                     _, name, pubkey_b64 = message.split(":", 2)
                     if name != my_name:
                         pubkey_bytes = base64.b64decode(pubkey_b64)
+
+                        # Tính fingerprint
+                        fp = public_key_fingerprint(pubkey_bytes)
+
+                        # TOFU: nếu chưa biết user này -> lưu fingerprint lần đầu
+                        if name not in known_keys:
+                            known_keys[name] = fp
+                            save_known_keys()
+                            print(f"[HE THONG] {name} vua tham gia. Fingerprint key: {fp}")
+                            print("  >> Hay so sanh fingerprint nay qua kenh ngoai de dam bao an toan.")
+                        else:
+                            # Đã có fingerprint -> kiểm tra xem có đổi không
+                            if known_keys[name] != fp:
+                                print(f"[CANH BAO] Public key cua {name} DA THAY DOI!")
+                                print(f"  - Fingerprint cu : {known_keys[name]}")
+                                print(f"  - Fingerprint moi: {fp}")
+                                print("  >> Co the dang bi tan cong MITM hoac user cai lai key.")
+                                # Tùy chọn: KHÔNG cập nhật key mới để tránh bị MITM
+                                # continue  # bỏ qua, không lưu public key mới
+                                # Ở đây mình sẽ không update user_directory nếu key đổi:
+                                continue
+
+                        # Nếu fingerprint ổn -> lưu public key
                         user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
                         print(f"[HE THONG] {name} vua tham gia. San sang ket noi E2EE.")
 
-                                # SERVER gửi về:
+                # SERVER gửi về:
                 #   SESSION_OFFER:<sender_name_thực>:<encrypted_key_b64>
                 # => Ở phía client chỉ cần:
                 #   - Lấy sender_name để lưu session_keys[sender_name]
@@ -99,6 +149,8 @@ def start_client() -> None:
     except ConnectionRefusedError:
         print("Khong the ket noi den server. Server co dang chay khong?")
         return
+    
+    load_known_keys()
 
     try:
         message = client_socket.recv(1024).decode('utf-8')
@@ -237,7 +289,6 @@ def start_client() -> None:
         client_socket.close()
         print("Da ngat ket noi khoi server.")
         sys.exit(0)
-
 
 if __name__ == "__main__":
     start_client()

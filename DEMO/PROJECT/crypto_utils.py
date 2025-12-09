@@ -102,6 +102,9 @@ def generate_or_load_keys(name: str, password: str):
     - Nếu file chưa tồn tại: tạo mới, MÃ HÓA private key bằng password.
     - Nếu file đã tồn tại: yêu cầu đúng password để giải mã.
     """
+    os.makedirs("Keys/Private", exist_ok=True)
+    os.makedirs("Keys/Public", exist_ok=True)
+    
     private_key_file = f"Keys/Private/private_key_{name}.pem"
     public_key_file = f"Keys/Public/public_key_{name}.pem"
 
@@ -164,4 +167,15 @@ def generate_or_load_keys(name: str, password: str):
     except Exception as e:  # noqa: BLE001
         print(f"Loi khi xu ly khoa (co the do sai password): {e}")
         return None, None
+    
+def public_key_fingerprint(pubkey_bytes: bytes, length: int = 16) -> str:
+    """
+    Tạo fingerprint SHA-256 cho public key, trả về dạng hex rút gọn.
+    length: số ký tự hex muốn hiển thị (mặc định 16 = 64 bit).
+    """
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    digest.update(pubkey_bytes)
+    full = digest.finalize().hex()
+    return full[:length]
+
 # END OF FILE

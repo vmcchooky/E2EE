@@ -5,15 +5,18 @@ import base64
 from datetime import datetime
 from tkinter import messagebox
 
+import os
+import json
+
 # Import các hàm mã hóa của bạn
 from crypto_utils import (
     generate_aes_key, 
     rsa_encrypt, rsa_decrypt,
     aes_encrypt, aes_decrypt,
-    load_public_key_from_bytes
+    load_public_key_from_bytes,
+    public_key_fingerprint,
+    generate_or_load_keys
 )
-
-from crypto_utils import generate_or_load_keys
 
 # Cấu hình giao diện chung
 ctk.set_appearance_mode("Dark")  # Modes: "System" (standard), "Dark", "Light"
@@ -52,7 +55,7 @@ class ChatApp(ctk.CTk):
 
         # Nút kết nối thủ công (tạm thời)
         self.connect_btn = ctk.CTkButton(self.sidebar_frame, text="Connect Server", command=self.connect_server_dialog)
-        self.connect_btn.grid(row=2, column=0, padx=20, pady=10)
+        self.connect_btn.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
 
         # --- CỘT PHẢI: KHUNG CHAT ---
         # Khu vực hiển thị tin nhắn
@@ -80,6 +83,155 @@ class ChatApp(ctk.CTk):
         # Biến chọn người đang chat
         self.current_chat_partner = "Broadcast" # Mặc định chat chung
         self.user_buttons = {} # [FIX] Thêm dictionary để quản lý nút bấm
+        
+        self.known_keys = {}  # {name: fingerprint}
+        self.known_keys_file = "FingerPrint/known_keys_gui.json"
+        self.load_known_keys()
+        
+        # Khung bảo mật (chứa các nút fingerprint) - ẨN LÚC ĐẦU
+        self.security_frame = ctk.CTkFrame(self.sidebar_frame)
+        self.security_frame.grid(row=3, column=0, padx=20, pady=(0, 20), sticky="ew")
+        self.security_frame.grid_remove()  # ẩn đi cho tới khi connect xong
+
+        security_label = ctk.CTkLabel(
+            self.security_frame,
+            text="Bảo mật / Fingerprint",
+            font=ctk.CTkFont(size=14, weight="bold")
+        )
+        security_label.pack(pady=(5, 5))
+
+        # Nút xem fingerprint của chính mình
+        self.view_self_fp_btn = ctk.CTkButton(
+            self.security_frame,
+            text="Fingerprint của tôi",
+            command=self.show_self_fingerprint
+        )
+        self.view_self_fp_btn.pack(fill="x", pady=(0, 5))
+
+        # Nút xem fingerprint của người đang chọn
+        self.view_partner_fp_btn = ctk.CTkButton(
+            self.security_frame,
+            text="Fingerprint người đang chọn",
+            command=self.show_partner_fingerprint
+        )
+        self.view_partner_fp_btn.pack(fill="x", pady=(0, 5))
+
+    def format_fingerprint(self, fp: str) -> str:
+        """Định dạng fingerprint thành nhóm 4 ký tự: xxxx xxxx xxxx xxxx."""
+        if not fp:
+            return ""
+        raw = fp.replace(" ", "").strip()
+        return " ".join(raw[i:i+4] for i in range(0, len(raw), 4))
+
+    def show_fingerprint_popup(self, title: str, name: str, fp: str):
+        """Hiển thị popup fingerprint với dạng 4-4-4-4 và nút Copy clipboard."""
+        grouped = self.format_fingerprint(fp)
+
+        win = ctk.CTkToplevel(self)
+        win.title(title)
+        win.geometry("420x180")
+        win.resizable(False, False)
+        win.grab_set()  # khóa focus vào popup
+
+        label_title = ctk.CTkLabel(
+            win,
+            text=f"Fingerprint của {name}:",
+            font=ctk.CTkFont(size=14, weight="bold")
+        )
+        label_title.pack(pady=(15, 5))
+
+        label_fp = ctk.CTkLabel(
+            win,
+            text=grouped,
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        label_fp.pack(pady=(0, 15))
+
+        def copy_to_clipboard():
+            # Copy fingerprint "thô" (không cách) để paste dễ dùng
+            self.clipboard_clear()
+            self.clipboard_append(fp)
+            self.display_message(f"[INFO] Đã copy fingerprint của {name} vào clipboard.")
+
+        btn_frame = ctk.CTkFrame(win)
+        btn_frame.pack(pady=5)
+
+        copy_btn = ctk.CTkButton(btn_frame, text="Copy fingerprint", command=copy_to_clipboard)
+        copy_btn.grid(row=0, column=0, padx=5)
+
+        close_btn = ctk.CTkButton(btn_frame, text="Đóng", command=win.destroy)
+        close_btn.grid(row=0, column=1, padx=5)
+
+    def load_known_keys(self):
+        """Nạp danh sách fingerprint đã từng lưu (TOFU)."""
+        try:
+            if os.path.exists(self.known_keys_file):
+                with open(self.known_keys_file, "r", encoding="utf-8") as f:
+                    self.known_keys = json.load(f)
+            else:
+                self.known_keys = {}
+        except Exception:
+            # Nếu file lỗi format thì bỏ qua
+            self.known_keys = {}
+
+    def save_known_keys(self):
+        """Lưu danh sách fingerprint ra file."""
+        try:
+            folder = os.path.dirname(self.known_keys_file)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(self.known_keys_file, "w", encoding="utf-8") as f:
+                json.dump(self.known_keys, f, indent=2)
+        except Exception as e:
+            self.display_message(f"[ERROR] Lỗi khi lưu known_keys: {e}")
+
+    def show_self_fingerprint(self):
+        """Hiển thị fingerprint public key của chính client (popup + chat log)."""
+        if not hasattr(self, "my_public_key_bytes") or self.my_public_key_bytes is None:
+            self.display_message("[INFO] Bạn chưa kết nối nên chưa có fingerprint của chính mình.")
+            messagebox.showinfo("Fingerprint của bạn", "Bạn chưa kết nối nên chưa có fingerprint.")
+            return
+
+        fp = getattr(self, "my_fingerprint", None)
+        if not fp:
+            fp = public_key_fingerprint(self.my_public_key_bytes)
+            self.my_fingerprint = fp
+
+        grouped = self.format_fingerprint(fp)
+        self.display_message(
+            f"[INFO] Fingerprint của bạn ({self.username}): {grouped}"
+        )
+
+        self.show_fingerprint_popup("Fingerprint của bạn", self.username, fp)
+
+    def show_partner_fingerprint(self):
+        """Hiển thị fingerprint của người dùng đang được chọn trong danh bạ."""
+        name = self.current_chat_partner
+
+        if not name or name == "Broadcast":
+            messagebox.showinfo(
+                "Fingerprint",
+                "Hãy chọn một người dùng cụ thể trong danh bạ (không phải Broadcast)."
+            )
+            return
+
+        fp = self.known_keys.get(name)
+        if not fp:
+            self.display_message(
+                f"[INFO] Chưa có fingerprint đã lưu cho {name}. Có thể họ chưa online hoặc dữ liệu đã bị xóa."
+            )
+            messagebox.showinfo(
+                "Fingerprint",
+                f"Chưa có fingerprint đã lưu cho {name}."
+            )
+            return
+
+        grouped = self.format_fingerprint(fp)
+        self.display_message(
+            f"[INFO] Fingerprint đã tin cậy của {name}: {grouped}"
+        )
+
+        self.show_fingerprint_popup(f"Fingerprint của {name}", name, fp)
 
     def connect_server_dialog(self):
         dialog = ctk.CTkInputDialog(text="Nhập tên của bạn:", title="Đăng nhập")
@@ -105,11 +257,23 @@ class ChatApp(ctk.CTk):
         if not self.my_private_key:
             self.display_message("[ERROR] Không thể xử lý khóa (sai mật khẩu?).")
             return
+        
+        # Lưu lại public key & fingerprint của chính mình để sau xem lại
+        self.my_public_key_bytes = public_key_bytes
+        self.my_fingerprint = public_key_fingerprint(public_key_bytes)
 
         # 2. Kết nối Socket (Chạy ngầm)
-        threading.Thread(target=self.start_socket, args=(name, public_key_bytes), daemon=True).start()
+                # 2. Kết nối Socket (Chạy ngầm)
+        threading.Thread(
+            target=self.start_socket, 
+            args=(name, public_key_bytes), 
+            daemon=True
+        ).start()
+
+        # Tạm thời disable nút Connect, khung fingerprint sẽ chỉ hiện
+        # khi start_socket handshake thành công.
         self.connect_btn.configure(state="disabled")
-    
+
     def start_socket(self, name, public_key_bytes):
         HOST = '127.0.0.1'
         PORT = 12345
@@ -132,10 +296,19 @@ class ChatApp(ctk.CTk):
             if msg == "PUBKEY_REQ":
                 self.client_socket.sendall(public_key_bytes)
                 self.display_message("[SYSTEM] Đã kết nối thành công!")
+
+                # >>> HIỆN KHUNG FINGERPRINT SAU KHI KẾT NỐI THÀNH CÔNG <<<
+                def show_security():
+                    # chỉ hiện nếu chưa hiện
+                    self.security_frame.grid()  
+
+                self.after(0, show_security)
+
             else:
                 self.display_message(f"[ERROR] Handshake thất bại: {msg}")
                 self.client_socket.close()
                 return
+
 
             
             # Bắt đầu lắng nghe tin nhắn
@@ -170,11 +343,58 @@ class ChatApp(ctk.CTk):
             _, name, pubkey_b64 = message.split(":", 2)
             if name != self.username:
                 pubkey_bytes = base64.b64decode(pubkey_b64)
+
+                # Tính fingerprint hiện tại của public key mới nhận
+                fp = public_key_fingerprint(pubkey_bytes)
+
+                # Trường hợp 1: lần đầu thấy user này -> TOFU, tự tin lần đầu
+                if name not in self.known_keys:
+                    self.known_keys[name] = fp
+                    self.save_known_keys()
+                    # Cảnh báo nhẹ: cho user biết fingerprint để có thể tự check
+                    self.display_message(f"[INFO] {name} vừa online. Fingerprint key: {fp}")
+                    self.display_message(">> Nếu cần an toàn cao, hãy xác minh fingerprint bằng kênh khác.")
+                else:
+                    # Trường hợp 2: đã từng thấy user này trước đây -> kiểm tra fingerprint
+                    old_fp = self.known_keys[name]
+                    if old_fp != fp:
+                        # 1) CẢNH BÁO TRƯỚC ĐÓ: ghi rõ vào khung chat
+                        self.display_message(f"[WARNING] Public key của {name} đã thay đổi!")
+                        self.display_message(f"  - Fingerprint cũ : {old_fp}")
+                        self.display_message(f"  - Fingerprint mới: {fp}")
+                        self.display_message(">> Có thể là tấn công MITM hoặc người đó vừa đổi thiết bị / cài lại app.")
+
+                        # 2) POP-UP HỎI CÓ ACCEPT KEY MỚI KHÔNG
+                        accept = messagebox.askyesno(
+                            "Cảnh báo bảo mật",
+                            (
+                                f"Fingerprint của {name} đã thay đổi.\n\n"
+                                f"Cũ : {old_fp}\nMới: {fp}\n\n"
+                                "Nếu bạn ĐÃ xác minh qua kênh khác rằng đây thật sự là key mới của họ,\n"
+                                "hãy chọn 'Yes' để chấp nhận key mới.\n\n"
+                                "Nếu không chắc chắn, hãy chọn 'No' để từ chối (giữ key cũ)."
+                            )
+                        )
+
+                        if accept:
+                            # Người dùng CHỦ ĐỘNG chấp nhận: cập nhật fingerprint + public key
+                            self.known_keys[name] = fp
+                            self.save_known_keys()
+                            self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+                            self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
+                            self.add_user_button(name)
+                        else:
+                            # Từ chối key mới: KHÔNG update public key, không thêm nút chat
+                            self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
+                        return  # Quan trọng: kết thúc xử lý NEW_USER ở đây
+
+                # Nếu fingerprint ổn (lần đầu hoặc khớp fingerprint cũ) -> lưu public key, thêm vào danh bạ
                 self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
                 self.display_message(f"[INFO] {name} vừa online.")
                 self.add_user_button(name)
 
-        # SERVER đã chuẩn hóa format:
+
+        # SERVER đã chuẩn hóa format:~
         #   SESSION_OFFER:<sender_name_thực>:<encrypted_key_b64>
         # nên GUI không cần quan tâm client khác gửi gì lên server,
         # chỉ cần tin sender_name và content từ server.
