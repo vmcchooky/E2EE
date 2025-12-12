@@ -3,7 +3,8 @@ import socket
 import threading
 import sys
 import base64
-import getpass
+from getpass import getpass
+import time
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
@@ -31,6 +32,8 @@ my_name = ""
 my_private_key = None  # store private key object
 user_directory = {}   # {"Alice": <public_key_obj>}
 session_keys = {}     # {"Alice": <aes_key_bytes>}
+last_rekey_time = {}  # {"Alice": timestamp}
+REKEY_SUGGEST_INTERVAL = 300   # 5 phút -> gợi ý re-key
 
 def load_known_keys():
     """Nạp danh sách fingerprint đã lưu (TOFU)."""
@@ -157,25 +160,55 @@ def start_client() -> None:
         name = ""
         if message == "NAME":
             name = input("Nhap ten cua ban: ")
-            client_socket.send(name.encode('utf-8'))
+            client_socket.send((name + "\n").encode('utf-8'))
             global my_name
             my_name = name
         else:
             print("Server khong yeu cau ten.")
             client_socket.close()
             return
-        
-        # --- Hỏi password bảo vệ private key ---
-        private_key_file = f"private_key_{name}.pem"
+
+        # --- BƯỚC 1: XỬ LÝ PHẢN HỒI SAU KHI GỬI TÊN ---
+        msg = client_socket.recv(1024).decode('utf-8').strip()
+
+        # Nếu server trả về lỗi (tên trùng / tên không hợp lệ)
+        if msg.startswith("[ERROR]"):
+            print(msg)
+            client_socket.close()
+            return
+
+        # --- BƯỚC 2: AUTH VỚI SERVER ---
+        if msg == "AUTH_REQ":
+            server_pwd = getpass("Nhap mat khau dang nhap server (lan dau se dung de dang ky): ")
+            client_socket.send(server_pwd.encode("utf-8"))
+
+            auth_resp = client_socket.recv(1024).decode("utf-8").strip()
+            if auth_resp.startswith("[ERROR]"):
+                print(f"[AUTH] Xac thuc that bai: {auth_resp}")
+                client_socket.close()
+                return
+            if auth_resp != "AUTH_OK":
+                print(f"[AUTH] Handshake AUTH khong hop le: {auth_resp}")
+                client_socket.close()
+                return
+
+            print("[AUTH] Xac thuc voi server thanh cong.")
+        else:
+            print(f"[AUTH] Mong doi 'AUTH_REQ' nhung nhan: {msg}")
+            client_socket.close()
+            return
+
+        # --- Hỏi password bảo vệ private key (RSA) ---
+        private_key_file = f"Keys/Private/private_key_{name}.pem"
 
         if os.path.exists(private_key_file):
             # Đã có khóa -> yêu cầu nhập password để mở
-            pwd = getpass.getpass("Nhap mat khau de mo private key: ")
+            pwd = getpass("Nhap mat khau de mo private key: ")
         else:
             # Chưa có -> tạo mật khẩu mới
             while True:
-                pwd1 = getpass.getpass("Tao mat khau moi de bao ve private key: ")
-                pwd2 = getpass.getpass("Nhap lai mat khau: ")
+                pwd1 = getpass("Tao mat khau moi de bao ve private key: ")
+                pwd2 = getpass("Nhap lai mat khau: ")
                 if pwd1 != pwd2:
                     print("Mat khau khong khop, vui long thu lai.")
                     continue
@@ -193,7 +226,8 @@ def start_client() -> None:
             client_socket.close()
             return
 
-        msg = client_socket.recv(1024).decode('utf-8')
+        # --- BƯỚC 3: CHỜ YÊU CẦU PUBKEY TỪ SERVER ---
+        msg = client_socket.recv(1024).decode('utf-8').strip()
 
         # Nếu server trả về lỗi
         if msg.startswith("[ERROR]"):

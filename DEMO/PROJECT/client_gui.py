@@ -74,6 +74,7 @@ class ChatApp(ctk.CTk):
         # Biến trạng thái
         self.username = ""
         self.client_socket = None
+        self.server_password = None
         
         # Thêm các biến quản lý logic E2EE
         self.user_directory = {} # {name: public_key}
@@ -239,39 +240,48 @@ class ChatApp(ctk.CTk):
         if not name:
             return
 
-        # Hỏi password (tạm thời dùng InputDialog, password lộ nhưng chấp nhận cho demo)
-        pwd_dialog = ctk.CTkInputDialog(
-            text="Nhập mật khẩu bảo vệ private key (tạo mới hoặc dùng lại):",
-            title="Mật khẩu"
+        # Hỏi password đăng nhập server
+        server_pwd_dialog = ctk.CTkInputDialog(
+            text="Nhập mật khẩu đăng nhập server\n(Nếu là lần đầu, mật khẩu này sẽ dùng để đăng ký):",
+            title="Mật khẩu server"
         )
-        password = pwd_dialog.get_input()
-        if not password:
-            messagebox.showerror("Lỗi", "Mật khẩu không được rỗng.")
+        server_password = server_pwd_dialog.get_input()
+        if not server_password:
+            messagebox.showerror("Lỗi", "Mật khẩu server không được rỗng.")
+            return
+
+        # Hỏi password bảo vệ private key
+        key_pwd_dialog = ctk.CTkInputDialog(
+            text="Nhập mật khẩu bảo vệ private key (tạo mới hoặc dùng lại):",
+            title="Mật khẩu private key"
+        )
+        key_password = key_pwd_dialog.get_input()
+        if not key_password:
+            messagebox.showerror("Lỗi", "Mật khẩu private key không được rỗng.")
             return
 
         self.username = name
+        self.server_password = server_password
         self.title(f"Secure Chat - {self.username}")
 
         # 1. Logic tạo/nạp khóa RSA (có password)
-        self.my_private_key, public_key_bytes = generate_or_load_keys(name, password)
+        self.my_private_key, public_key_bytes = generate_or_load_keys(name, key_password)
         if not self.my_private_key:
             self.display_message("[ERROR] Không thể xử lý khóa (sai mật khẩu?).")
             return
-        
+
         # Lưu lại public key & fingerprint của chính mình để sau xem lại
         self.my_public_key_bytes = public_key_bytes
         self.my_fingerprint = public_key_fingerprint(public_key_bytes)
 
         # 2. Kết nối Socket (Chạy ngầm)
-                # 2. Kết nối Socket (Chạy ngầm)
         threading.Thread(
-            target=self.start_socket, 
-            args=(name, public_key_bytes), 
+            target=self.start_socket,
+            args=(name, public_key_bytes),
             daemon=True
         ).start()
 
-        # Tạm thời disable nút Connect, khung fingerprint sẽ chỉ hiện
-        # khi start_socket handshake thành công.
+        # Disable nút Connect, khung fingerprint sẽ hiện sau khi kết nối OK
         self.connect_btn.configure(state="disabled")
 
     def start_socket(self, name, public_key_bytes):
@@ -281,15 +291,50 @@ class ChatApp(ctk.CTk):
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((HOST, PORT))
             
-            # Logic xác thực với server (Tuần 4)
             # Nhận yêu cầu tên
-            msg = self.client_socket.recv(1024).decode('utf-8')
+            msg = self.client_socket.recv(1024).decode('utf-8').strip()
             if msg == "NAME":
                 self.client_socket.send((name + "\n").encode('utf-8'))
-            
-            msg = self.client_socket.recv(1024).decode('utf-8')
+            else:
+                self.display_message(f"[ERROR] Server không yêu cầu NAME mà gửi: {msg}")
+                self.client_socket.close()
+                return
+
+            # Nhận phản hồi sau khi gửi tên: hoặc [ERROR] hoặc AUTH_REQ
+            msg = self.client_socket.recv(1024).decode('utf-8').strip()
             if msg.startswith("[ERROR]"):
-                self.display_message(msg.strip())
+                self.display_message(msg)
+                self.client_socket.close()
+                return
+
+            if msg == "AUTH_REQ":
+                # Gửi mật khẩu server
+                if not self.server_password:
+                    self.display_message("[ERROR] Chưa có mật khẩu server.")
+                    self.client_socket.close()
+                    return
+                self.client_socket.send(self.server_password.encode("utf-8"))
+
+                auth_resp = self.client_socket.recv(1024).decode("utf-8").strip()
+                if auth_resp.startswith("[ERROR]"):
+                    self.display_message(f"[ERROR] Xác thực thất bại: {auth_resp}")
+                    self.client_socket.close()
+                    return
+                if auth_resp != "AUTH_OK":
+                    self.display_message(f"[ERROR] Handshake AUTH không hợp lệ: {auth_resp}")
+                    self.client_socket.close()
+                    return
+
+                self.display_message("[SYSTEM] Xác thực với server thành công.")
+            else:
+                self.display_message(f"[ERROR] Mong đợi AUTH_REQ nhưng nhận: {msg}")
+                self.client_socket.close()
+                return
+
+            # Yêu cầu public key
+            msg = self.client_socket.recv(1024).decode('utf-8').strip()
+            if msg.startswith("[ERROR]"):
+                self.display_message(msg)
                 self.client_socket.close()
                 return
 
@@ -297,20 +342,15 @@ class ChatApp(ctk.CTk):
                 self.client_socket.sendall(public_key_bytes)
                 self.display_message("[SYSTEM] Đã kết nối thành công!")
 
-                # >>> HIỆN KHUNG FINGERPRINT SAU KHI KẾT NỐI THÀNH CÔNG <<<
+                # Hiện khung fingerprint
                 def show_security():
-                    # chỉ hiện nếu chưa hiện
-                    self.security_frame.grid()  
-
+                    self.security_frame.grid()
                 self.after(0, show_security)
-
             else:
                 self.display_message(f"[ERROR] Handshake thất bại: {msg}")
                 self.client_socket.close()
                 return
 
-
-            
             # Bắt đầu lắng nghe tin nhắn
             self.receive_messages()
             

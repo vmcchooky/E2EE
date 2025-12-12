@@ -2,6 +2,9 @@
 import socket
 import threading
 import sys
+import os
+import json
+import hashlib
 
 # ============================================================
 # PROTOCOL GIỮA SERVER VÀ CLIENT (dạng text + '\n')
@@ -44,15 +47,43 @@ import sys
 #         "<sender_name>: <text>\n"
 # ============================================================
 
+AUTH_FILE = "Users/auth_users.json"
+user_db = {}  # {name: password_hash}
 
 HOST = '127.0.0.1'
 PORT = 12345
 
 server_running = True
 clients_data = {}  # socket -> {"name": str, "pubkey": bytes}
+        
+def load_user_db():
+    """Nạp database user từ file JSON (nếu có)."""
+    global user_db
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE, "r", encoding="utf-8") as f:
+                user_db = json.load(f)
+        except Exception:
+            user_db = {}
+    else:
+        user_db = {}
+        
+def save_user_db():
+    """Lưu database user ra file JSON."""
+    try:
+        folder = os.path.dirname(AUTH_FILE)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_db, f, indent=2)
+    except Exception as e:
+        print(f"[AUTH] Loi khi luu auth db: {e}")
 
+        
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+load_user_db()
 
 def broadcast(message: bytes, _client_socket: socket.socket) -> None:
     """
@@ -86,7 +117,38 @@ def handle_client(client_socket: socket.socket) -> None:
              client_socket.send("[ERROR] Ten khong chua ky tu dac biet.\n".encode('utf-8'))
              client_socket.close()
              return
+        
+        # --- BƯỚC 2: XÁC THỰC USERNAME + PASSWORD ĐƠN GIẢN ---
+        client_socket.send("AUTH_REQ".encode("utf-8"))
+        password = client_socket.recv(1024).decode("utf-8").strip()
 
+        if not password:
+            client_socket.send("[ERROR] Mat khau khong duoc rong.\n".encode("utf-8"))
+            client_socket.close()
+            return
+
+        password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+        global user_db
+        stored_hash = user_db.get(name)
+
+        if stored_hash is None:
+            # Chưa có user này -> ĐĂNG KÝ mới
+            user_db[name] = password_hash
+            save_user_db()
+            print(f"[AUTH] Dang ky user moi: {name}")
+            client_socket.send("AUTH_OK".encode("utf-8"))
+        elif stored_hash == password_hash:
+            # Đăng nhập
+            print(f"[AUTH] {name} dang nhap thanh cong.")
+            client_socket.send("AUTH_OK".encode("utf-8"))
+        else:
+            # Sai mật khẩu
+            print(f"[AUTH] {name} nhap sai mat khau.")
+            client_socket.send("[ERROR] Sai mat khau.\n".encode("utf-8"))
+            client_socket.close()
+            return
+        # Yêu cầu public key từ client
         client_socket.send("PUBKEY_REQ".encode('utf-8'))
         pubkey_bytes = client_socket.recv(2048)
 
