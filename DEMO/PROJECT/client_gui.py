@@ -32,7 +32,12 @@ class ChatApp(ctk.CTk):
 
         # 2. Layout: Chia lưới 2 cột (1 cột danh sách user, 1 cột chat)
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        # Hàng 0: header chat (không mở rộng)
+        self.grid_rowconfigure(0, weight=0)
+        # Hàng 1: khung chat (mở rộng theo chiều dọc)
+        self.grid_rowconfigure(1, weight=1)
+        # Hàng 2: input (không mở rộng)
+        self.grid_rowconfigure(2, weight=0)
 
         # --- CỘT TRÁI: DANH SÁCH USER ---
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
@@ -58,18 +63,60 @@ class ChatApp(ctk.CTk):
         self.connect_btn.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
 
         # --- CỘT PHẢI: KHUNG CHAT ---
+
+        # Thanh tiêu đề khung chat (hiển thị partner + nút Re-key)
+        self.chat_header_frame = ctk.CTkFrame(self)
+        self.chat_header_frame.grid(
+            row=0, column=1,
+            padx=(20, 20), pady=(20, 0),
+            sticky="ew"
+        )
+        self.chat_header_frame.grid_columnconfigure(0, weight=1)
+
+        self.chat_title_label = ctk.CTkLabel(
+            self.chat_header_frame,
+            text="Chat chung (Broadcast)",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self.chat_title_label.grid(row=0, column=0, sticky="w")
+
+        # Nút Re-key: chỉ enable khi đang chat riêng và đã có E2EE
+        self.rekey_button = ctk.CTkButton(
+            self.chat_header_frame,
+            text="Re-key",
+            width=80,
+            command=self.rekey_current_session
+        )
+        self.rekey_button.grid(row=0, column=1, padx=(10, 0))
+        self.rekey_button.configure(state="disabled")
+
+        # --- CỘT PHẢI: KHUNG CHAT ---
         # Khu vực hiển thị tin nhắn
         self.chat_display = ctk.CTkTextbox(self, width=250)
-        self.chat_display.grid(row=0, column=1, padx=(20, 20), pady=(20, 0), sticky="nsew")
+        self.chat_display.grid(
+            row=1, column=1,
+            padx=(20, 20), pady=(10, 0),
+            sticky="nsew"
+        )
+
         self.chat_display.configure(state="disabled") # Chỉ đọc, không cho gõ trực tiếp vào đây
 
-        # Khu vực nhập tin nhắn
-        self.entry_message = ctk.CTkEntry(self, placeholder_text="Nhập tin nhắn...")
-        self.entry_message.grid(row=1, column=1, padx=(20, 20), pady=(20, 20), sticky="ew")
+        # Khung chứa ô nhập và nút gửi
+        self.input_frame = ctk.CTkFrame(self)
+        self.input_frame.grid(
+            row=2, column=1,
+            padx=(20, 20), pady=(10, 20),
+            sticky="ew"
+        )
+        self.input_frame.grid_columnconfigure(0, weight=1)
 
-        # Nút gửi và Nút chọn chế độ
-        self.send_button = ctk.CTkButton(self, text="Gửi", command=self.send_message_event)
-        self.send_button.grid(row=1, column=1, padx=(20, 20), pady=(20, 20), sticky="e") # Căn phải đè lên entry
+        # Khu vực nhập tin nhắn
+        self.entry_message = ctk.CTkEntry(self.input_frame, placeholder_text="Nhập tin nhắn...")
+        self.entry_message.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
+
+        # Nút gửi
+        self.send_button = ctk.CTkButton(self.input_frame, text="Gửi", command=self.send_message_event, width=80)
+        self.send_button.grid(row=0, column=1, pady=0, sticky="e")
 
         # Biến trạng thái
         self.username = ""
@@ -84,7 +131,10 @@ class ChatApp(ctk.CTk):
         # Biến chọn người đang chat
         self.current_chat_partner = "Broadcast" # Mặc định chat chung
         self.user_buttons = {} # [FIX] Thêm dictionary để quản lý nút bấm
+        # Cập nhật header chat ban đầu
+        self.update_chat_header()
         
+        # Biến quản lý fingerprint đã biết (TOFU)
         self.known_keys = {}  # {name: fingerprint}
         self.known_keys_file = "FingerPrint/known_keys_gui.json"
         self.load_known_keys()
@@ -116,6 +166,25 @@ class ChatApp(ctk.CTk):
             command=self.show_partner_fingerprint
         )
         self.view_partner_fp_btn.pack(fill="x", pady=(0, 5))
+
+    def update_chat_header(self):
+        """Cập nhật tiêu đề khung chat và trạng thái nút Re-key."""
+        partner = self.current_chat_partner
+
+        if partner == "Broadcast":
+            self.chat_title_label.configure(text="Chat chung (Broadcast)")
+            self.rekey_button.configure(state="disabled")
+            return
+
+        # Đang chat riêng
+        if partner in self.session_keys:
+            # Đã có khóa E2EE với partner này
+            self.chat_title_label.configure(text=f"Chat với: {partner} (🔒)")
+            self.rekey_button.configure(state="normal")
+        else:
+            # Chưa có khóa / đang thiết lập
+            self.chat_title_label.configure(text=f"Chat với: {partner} (đang thiết lập khóa...)")
+            self.rekey_button.configure(state="disabled")
 
     def format_fingerprint(self, fp: str) -> str:
         """Định dạng fingerprint thành nhóm 4 ký tự: xxxx xxxx xxxx xxxx."""
@@ -450,7 +519,10 @@ class ChatApp(ctk.CTk):
                 # [UX UPDATE] Nếu đang mở cửa sổ chat với người này, cập nhật label
                 if self.current_chat_partner == sender_name:
                     self.logo_label.configure(text=f"Chat với: {sender_name} (🔒)", text_color="green")
-                    
+                
+                # Dù đang chọn ai, luôn sync lại header
+                self.update_chat_header()
+        
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý SESSION_OFFER: {e}")
                 
@@ -534,13 +606,16 @@ class ChatApp(ctk.CTk):
         else:
             self.logo_label.configure(text=f"Chat với: {name} (🔒)", text_color="green")
             self.display_message(f"--- Đã chuyển sang chế độ chat an toàn với {name} ---")
-     
+        # Cập nhật tiêu đề khung chat và trạng thái nút Re-key
+        self.update_chat_header()
+        
     def select_broadcast(self):
         """Chuyển về phòng chat chung (Broadcast), không mã hóa E2EE."""
         self.current_chat_partner = "Broadcast"
         # Cập nhật tiêu đề bên trái cho dễ nhìn
         self.logo_label.configure(text="DANH BẠ - Chat chung", text_color="white")
         self.display_message("--- Đã chuyển sang phòng chat chung (Broadcast) ---")
+        self.update_chat_header()
                
     def perform_handshake(self, target_name):
         """Tạo AES key, mã hóa bằng RSA của target và gửi SESSION_OFFER."""
@@ -567,8 +642,44 @@ class ChatApp(ctk.CTk):
         except Exception as e:  # noqa: BLE001
             self.display_message(f"[ERROR] Lỗi khi bắt tay với {target_name}: {e}")
       
-    # Trong client_gui.py -> class ChatApp
+    def rekey_current_session(self):
+        """Đổi lại AES key cho phiên chat hiện tại (GUI-only)."""
+        target = self.current_chat_partner
 
+        if target == "Broadcast":
+            self.display_message("[INFO] Không thể Re-key trong phòng Broadcast.")
+            return
+
+        if target == self.username:
+            self.display_message("[ERROR] Không thể Re-key với chính mình.")
+            return
+
+        if target not in self.user_directory:
+            self.display_message(f"[ERROR] Không tìm thấy public key của {target}.")
+            return
+
+        if not self.client_socket:
+            self.display_message("[ERROR] Chưa kết nối server.")
+            return
+
+        try:
+            target_pubkey_obj = self.user_directory[target]
+            aes_key = generate_aes_key()
+            encrypted_aes_key = rsa_encrypt(aes_key, target_pubkey_obj)
+            self.session_keys[target] = aes_key  # cập nhật key mới
+
+            encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode("utf-8")
+            offer_message = f"SESSION_OFFER:{target}:{self.username}:{encrypted_key_b64}\n"
+            self.client_socket.sendall(offer_message.encode("utf-8"))
+
+            self.display_message(f"[SYSTEM] Đã Re-key E2EE với {target}.")
+            # Sau khi re-key, chắc chắn đang có khóa
+            self.update_chat_header()
+
+        except Exception as e:  # noqa: BLE001
+            self.display_message(f"[ERROR] Lỗi khi Re-key với {target}: {e}")
+
+    # Trong client_gui.py -> class ChatApp
     def display_message(self, text):
         # Dùng self.after để đẩy việc cập nhật UI về luồng chính
         self.after(0, self._safe_display_message, text)
