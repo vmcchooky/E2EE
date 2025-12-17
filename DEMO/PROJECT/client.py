@@ -5,6 +5,7 @@ import sys
 import base64
 from getpass import getpass
 import time
+import json
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
@@ -22,11 +23,15 @@ from crypto_utils import (
     public_key_fingerprint,
 )
 
-import json
+from protocol import (
+    TYPE_NAME_REQ, TYPE_AUTH_REQ, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ,
+    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_PRIVATE_MSG, TYPE_BROADCAST
+)
+from transport import ProtoClient
+
 
 KNOWN_KEYS_FILE = "FingerPrint/known_keys.json"
 known_keys = {}   # {"Alice": "abcd1234..."}
-
 
 my_name = ""
 my_private_key = None  # store private key object
@@ -56,91 +61,82 @@ def save_known_keys():
     except Exception as e:
         print(f"Loi khi luu known_keys: {e}")
 
-def receive_messages(client_socket: socket.socket) -> None:
-    """Listen for incoming messages from server on a background thread."""
-    buffer = ""
+def receive_messages(proto: ProtoClient) -> None:
     while True:
         try:
-            data = client_socket.recv(2048).decode("utf-8")
-            if not data:
-                print("Mat ket noi voi server.")
-                break
+            m = proto.recv()
+            t = m["type"]
 
-            buffer += data
+            if t == TYPE_USER_ANNOUNCE:
+                name = m["payload"]["name"]
+                pubkey_b64 = m["payload"]["pubkey_b64"]
 
-            while "\n" in buffer:
-                message, buffer = buffer.split("\n", 1)
-                if not message:
+                # user offline
+                if pubkey_b64 is None:
+                    print(f"[INFO] {name} vua offline.")
+                    user_directory.pop(name, None)
+                    session_keys.pop(name, None)
+                    last_rekey_time.pop(name, None)
                     continue
 
-                if message.startswith("NEW_USER:"):
-                    _, name, pubkey_b64 = message.split(":", 2)
-                    if name != my_name:
-                        pubkey_bytes = base64.b64decode(pubkey_b64)
+                if name == my_name:
+                    continue
 
-                        # Tính fingerprint
-                        fp = public_key_fingerprint(pubkey_bytes)
+                pubkey_bytes = base64.b64decode(pubkey_b64)
+                fp = public_key_fingerprint(pubkey_bytes)
 
-                        # TOFU: nếu chưa biết user này -> lưu fingerprint lần đầu
-                        if name not in known_keys:
-                            known_keys[name] = fp
-                            save_known_keys()
-                            print(f"[HE THONG] {name} vua tham gia. Fingerprint key: {fp}")
-                            print("  >> Hay so sanh fingerprint nay qua kenh ngoai de dam bao an toan.")
-                        else:
-                            # Đã có fingerprint -> kiểm tra xem có đổi không
-                            if known_keys[name] != fp:
-                                print(f"[CANH BAO] Public key cua {name} DA THAY DOI!")
-                                print(f"  - Fingerprint cu : {known_keys[name]}")
-                                print(f"  - Fingerprint moi: {fp}")
-                                print("  >> Co the dang bi tan cong MITM hoac user cai lai key.")
-                                # Tùy chọn: KHÔNG cập nhật key mới để tránh bị MITM
-                                # continue  # bỏ qua, không lưu public key mới
-                                # Ở đây mình sẽ không update user_directory nếu key đổi:
-                                continue
-
-                        # Nếu fingerprint ổn -> lưu public key
-                        user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
-                        print(f"[HE THONG] {name} vua tham gia. San sang ket noi E2EE.")
-
-                # SERVER gửi về:
-                #   SESSION_OFFER:<sender_name_thực>:<encrypted_key_b64>
-                # => Ở phía client chỉ cần:
-                #   - Lấy sender_name để lưu session_keys[sender_name]
-                #   - Giải mã encrypted_key_b64 bằng private_key của chính mình.
-
-                elif message.startswith("SESSION_OFFER:"):
-                    _, sender_name, encrypted_key_b64 = message.split(":", 2)
-                    encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
-                    aes_key = rsa_decrypt(encrypted_key_bytes, my_private_key)
-                    session_keys[sender_name] = aes_key
-                    print(f"[HE THONG] Da thiet lap phien E2EE voi {sender_name}.")
-
-                elif message.startswith("<"):
-                    print(message)
-
-                elif message.startswith("PRIVATE_MSG:"):
-                    try:
-                        _, sender_name, encrypted_content_b64 = message.split(":", 2)
-                        if sender_name in session_keys:
-                            session_key = session_keys[sender_name]
-                            encrypted_bytes = base64.b64decode(encrypted_content_b64)
-                            decrypted_text = aes_decrypt(encrypted_bytes, session_key)
-                            if decrypted_text:
-                                print(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
-                            else:
-                                print(f"[LOI] Khong the giai ma tin nhan tu {sender_name}.")
-                        else:
-                            print(f"[INFO] Nhan tin nhan ma hoa tu {sender_name} nhung chua co khoa. Hay go /connect {sender_name}")
-                    except Exception as e:  # noqa: BLE001
-                        print(f"Loi xu ly tin nhan rieng: {e}")
-
+                if name not in known_keys:
+                    known_keys[name] = fp
+                    save_known_keys()
+                    print(f"[HE THONG] {name} vua tham gia. Fingerprint key: {fp}")
+                    print("  >> Hay so sanh fingerprint nay qua kenh ngoai de dam bao an toan.")
                 else:
-                    print(message)
-        except Exception as e:  # noqa: BLE001
+                    if known_keys[name] != fp:
+                        print(f"[CANH BAO] Public key cua {name} DA THAY DOI!")
+                        print(f"  - Fingerprint cu : {known_keys[name]}")
+                        print(f"  - Fingerprint moi: {fp}")
+                        print("  >> Co the dang bi tan cong MITM hoac user cai lai key.")
+                        continue
+
+                user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+                print(f"[HE THONG] {name} vua tham gia. San sang ket noi E2EE.")
+
+            elif t == TYPE_SESSION_OFFER:
+                sender_name = m["payload"]["from"]
+                encrypted_key_b64 = m["payload"]["encrypted_key_b64"]
+                encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
+                aes_key = rsa_decrypt(encrypted_key_bytes, my_private_key)
+                session_keys[sender_name] = aes_key
+                last_rekey_time[sender_name] = time.time()
+                print(f"[HE THONG] Da thiet lap / cap nhat phien E2EE voi {sender_name}.")
+
+            elif t == TYPE_PRIVATE_MSG:
+                sender_name = m["payload"]["from"]
+                encrypted_content_b64 = m["payload"]["ciphertext_b64"]
+                if sender_name in session_keys:
+                    session_key = session_keys[sender_name]
+                    encrypted_bytes = base64.b64decode(encrypted_content_b64)
+                    decrypted_text = aes_decrypt(encrypted_bytes, session_key)
+                    if decrypted_text:
+                        print(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
+                    else:
+                        print(f"[LOI] Khong the giai ma tin nhan tu {sender_name}.")
+                else:
+                    print(f"[INFO] Nhan tin nhan ma hoa tu {sender_name} nhung chua co khoa. Hay go /connect {sender_name}")
+
+            elif t == TYPE_BROADCAST:
+                print(f"<{m['payload']['from']}> {m['payload']['text']}")
+
+            elif t == TYPE_ERROR:
+                print(f"[ERROR] {m['payload']['message']}")
+
+            else:
+                print(f"[UNKNOWN] {m}")
+
+        except Exception as e:
             print(f"Loi khi nhan tin nhan: {e}")
-            client_socket.close()
             break
+
 
 def start_client() -> None:
     HOST = '127.0.0.1'
@@ -152,53 +148,53 @@ def start_client() -> None:
     except ConnectionRefusedError:
         print("Khong the ket noi den server. Server co dang chay khong?")
         return
+    proto = ProtoClient(client_socket)
     
     load_known_keys()
 
     try:
-        message = client_socket.recv(1024).decode('utf-8')
-        name = ""
-        if message == "NAME":
-            name = input("Nhap ten cua ban: ")
-            client_socket.send((name + "\n").encode('utf-8'))
-            global my_name
-            my_name = name
-        else:
-            print("Server khong yeu cau ten.")
+        m = proto.recv()
+        if m["type"] != TYPE_NAME_REQ:
+            print(f"[ERROR] Expected NAME_REQ, got {m}")
             client_socket.close()
             return
 
-        # --- BƯỚC 1: XỬ LÝ PHẢN HỒI SAU KHI GỬI TÊN ---
-        msg = client_socket.recv(1024).decode('utf-8').strip()
-
-        # Nếu server trả về lỗi (tên trùng / tên không hợp lệ)
-        if msg.startswith("[ERROR]"):
-            print(msg)
+        name = input("Nhap ten cua ban: ").strip()
+        if not name:
+            print("[ERROR] Name cannot be empty")
             client_socket.close()
             return
 
-        # --- BƯỚC 2: AUTH VỚI SERVER ---
-        if msg == "AUTH_REQ":
-            server_pwd = getpass("Nhap mat khau dang nhap server (lan dau se dung de dang ky): ")
-            client_socket.send(server_pwd.encode("utf-8"))
+        proto.send_name(name)
+        global my_name
+        my_name = name
 
-            auth_resp = client_socket.recv(1024).decode("utf-8").strip()
-            if auth_resp.startswith("[ERROR]"):
-                print(f"[AUTH] Xac thuc that bai: {auth_resp}")
-                client_socket.close()
-                return
-            if auth_resp != "AUTH_OK":
-                print(f"[AUTH] Handshake AUTH khong hop le: {auth_resp}")
-                client_socket.close()
-                return
-
-            print("[AUTH] Xac thuc voi server thanh cong.")
-        else:
-            print(f"[AUTH] Mong doi 'AUTH_REQ' nhung nhan: {msg}")
+        # AUTH
+        m = proto.recv()
+        if m["type"] == TYPE_ERROR:
+            print(f"[ERROR] {m['payload']['message']}")
+            client_socket.close()
+            return
+        if m["type"] != TYPE_AUTH_REQ:
+            print(f"[ERROR] Expected AUTH_REQ, got {m}")
             client_socket.close()
             return
 
-        # --- Hỏi password bảo vệ private key (RSA) ---
+        server_pwd = getpass("Nhap mat khau dang nhap server (lan dau se dung de dang ky): ")
+        proto.send_auth(server_pwd)
+
+        m = proto.recv()
+        if m["type"] == TYPE_ERROR:
+            print(f"[AUTH] That bai: {m['payload']['message']}")
+            client_socket.close()
+            return
+        if m["type"] != TYPE_AUTH_OK:
+            print(f"[AUTH] Khong hop le: {m}")
+            client_socket.close()
+            return
+        print("[AUTH] Xac thuc voi server thanh cong.")
+
+        # Hỏi password bảo vệ private key (RSA) - giữ nguyên logic bạn đang có
         private_key_file = f"Keys/Private/private_key_{name}.pem"
 
         if os.path.exists(private_key_file):
@@ -226,30 +222,27 @@ def start_client() -> None:
             client_socket.close()
             return
 
-        # --- BƯỚC 3: CHỜ YÊU CẦU PUBKEY TỪ SERVER ---
-        msg = client_socket.recv(1024).decode('utf-8').strip()
-
-        # Nếu server trả về lỗi
-        if msg.startswith("[ERROR]"):
-            print(msg.strip())
+        # PUBKEY
+        m = proto.recv()
+        if m["type"] == TYPE_ERROR:
+            print(f"[ERROR] {m['payload']['message']}")
+            client_socket.close()
+            return
+        if m["type"] != TYPE_PUBKEY_REQ:
+            print(f"[ERROR] Expected PUBKEY_REQ, got {m}")
             client_socket.close()
             return
 
-        # Nếu server yêu cầu public key
-        if msg == "PUBKEY_REQ":
-            client_socket.sendall(public_key_bytes)
-            print("[SYSTEM] Đã kết nối thành công!")
-        else:
-            print(f"[ERROR] Handshake thất bại: {msg}")
-            client_socket.close()
-            return
+        pubkey_b64 = base64.b64encode(public_key_bytes).decode("utf-8")
+        proto.send_pubkey(pubkey_b64)
+        print("[SYSTEM] Da ket noi thanh cong!")
 
     except Exception as e:  # noqa: BLE001
         print(f"Loi trong qua trinh thiet lap ket noi: {e}")
         client_socket.close()
         return
 
-    receive_thread = threading.Thread(target=receive_messages, args=(client_socket,))
+    receive_thread = threading.Thread(target=receive_messages, args=(proto,))
     receive_thread.daemon = True
     receive_thread.start()
 
@@ -280,10 +273,10 @@ def start_client() -> None:
                 aes_key = generate_aes_key()
                 encrypted_aes_key = rsa_encrypt(aes_key, target_pubkey_obj)
                 session_keys[target_name] = aes_key
+                last_rekey_time[target_name] = time.time()
 
                 encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
-                offer_message = f"SESSION_OFFER:{target_name}:{my_name}:{encrypted_key_b64}\n"
-                client_socket.sendall(offer_message.encode('utf-8'))
+                proto.send_session_offer(target_name, encrypted_key_b64)
                 print(f"[HE THONG] Da gui loi moi E2EE den {target_name}.")
 
             elif message.startswith("/chat "):
@@ -299,6 +292,10 @@ def start_client() -> None:
                     if target_name not in session_keys:
                         print(f"[LOI] Chua co ket noi bao mat voi {target_name}. Hay dung /connect {target_name} truoc.")
                         continue
+                    last_t = last_rekey_time.get(target_name, 0)
+                    if last_t and (time.time() - last_t > REKEY_SUGGEST_INTERVAL):
+                        print(f"[INFO] Phien E2EE voi {target_name} da dung lau, "
+                              f"ban nen re-key (GUI co nut Re-key, hoac tu mo rong CLI).")
 
                     session_key = session_keys[target_name]
                     encrypted_bytes = aes_encrypt(plain_content.encode('utf-8'), session_key)
@@ -307,15 +304,14 @@ def start_client() -> None:
                         continue
                     encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
 
-                    final_msg = f"PRIVATE_MSG:{target_name}:{encrypted_b64}\n"
-                    client_socket.send(final_msg.encode('utf-8'))
+                    proto.send_private_msg(target_name, encrypted_b64)
 
                     print(f"[DA GUI] toi {target_name}: {plain_content}")
 
                 except Exception as e:  # noqa: BLE001
                     print(f"Loi khi gui tin nhan: {e}")
             else:
-                client_socket.send((message + "\n").encode('utf-8'))
+                proto.send_broadcast(message)
 
     except KeyboardInterrupt:
         print("\nDang thoat...")

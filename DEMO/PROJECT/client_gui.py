@@ -18,6 +18,13 @@ from crypto_utils import (
     generate_or_load_keys
 )
 
+from protocol import (
+    TYPE_NAME_REQ, TYPE_AUTH_REQ, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ,
+    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_PRIVATE_MSG, TYPE_BROADCAST
+)
+
+from transport import ProtoClient
+
 # Cấu hình giao diện chung
 ctk.set_appearance_mode("Dark")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
@@ -359,194 +366,184 @@ class ChatApp(ctk.CTk):
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((HOST, PORT))
-            
-            # Nhận yêu cầu tên
-            msg = self.client_socket.recv(1024).decode('utf-8').strip()
-            if msg == "NAME":
-                self.client_socket.send((name + "\n").encode('utf-8'))
-            else:
-                self.display_message(f"[ERROR] Server không yêu cầu NAME mà gửi: {msg}")
+            self.proto = ProtoClient(self.client_socket)
+
+            # Handshake theo protocol (dùng ProtoClient)
+            m = self.proto.recv()
+            if m["type"] != TYPE_NAME_REQ:
+                self.display_message(f"[ERROR] Expected NAME_REQ, got {m}")
+                self.client_socket.close()
+                return
+            self.proto.send_name(name)
+
+            m = self.proto.recv()
+            if m["type"] == TYPE_ERROR:
+                self.display_message(f"[ERROR] {m['payload']['message']}")
+                self.client_socket.close()
+                return
+            if m["type"] != TYPE_AUTH_REQ:
+                self.display_message(f"[ERROR] Expected AUTH_REQ, got {m}")
+                self.client_socket.close()
+                return
+            self.proto.send_auth(self.server_password)
+
+            m = self.proto.recv()
+            if m["type"] == TYPE_ERROR:
+                self.display_message(f"[ERROR] Auth failed: {m['payload']['message']}")
+                self.client_socket.close()
+                return
+            if m["type"] != TYPE_AUTH_OK:
+                self.display_message(f"[ERROR] Expected AUTH_OK, got {m}")
                 self.client_socket.close()
                 return
 
-            # Nhận phản hồi sau khi gửi tên: hoặc [ERROR] hoặc AUTH_REQ
-            msg = self.client_socket.recv(1024).decode('utf-8').strip()
-            if msg.startswith("[ERROR]"):
-                self.display_message(msg)
+            m = self.proto.recv()
+            if m["type"] == TYPE_ERROR:
+                self.display_message(f"[ERROR] {m['payload']['message']}")
+                self.client_socket.close()
+                return
+            if m["type"] != TYPE_PUBKEY_REQ:
+                self.display_message(f"[ERROR] Expected PUBKEY_REQ, got {m}")
                 self.client_socket.close()
                 return
 
-            if msg == "AUTH_REQ":
-                # Gửi mật khẩu server
-                if not self.server_password:
-                    self.display_message("[ERROR] Chưa có mật khẩu server.")
-                    self.client_socket.close()
-                    return
-                self.client_socket.send(self.server_password.encode("utf-8"))
+            pubkey_b64 = base64.b64encode(public_key_bytes).decode("utf-8")
+            self.proto.send_pubkey(pubkey_b64)
 
-                auth_resp = self.client_socket.recv(1024).decode("utf-8").strip()
-                if auth_resp.startswith("[ERROR]"):
-                    self.display_message(f"[ERROR] Xác thực thất bại: {auth_resp}")
-                    self.client_socket.close()
-                    return
-                if auth_resp != "AUTH_OK":
-                    self.display_message(f"[ERROR] Handshake AUTH không hợp lệ: {auth_resp}")
-                    self.client_socket.close()
-                    return
+            self.display_message("[SYSTEM] Đã kết nối thành công!")
+            self.after(0, lambda: self.security_frame.grid())
 
-                self.display_message("[SYSTEM] Xác thực với server thành công.")
-            else:
-                self.display_message(f"[ERROR] Mong đợi AUTH_REQ nhưng nhận: {msg}")
-                self.client_socket.close()
-                return
-
-            # Yêu cầu public key
-            msg = self.client_socket.recv(1024).decode('utf-8').strip()
-            if msg.startswith("[ERROR]"):
-                self.display_message(msg)
-                self.client_socket.close()
-                return
-
-            if msg == "PUBKEY_REQ":
-                self.client_socket.sendall(public_key_bytes)
-                self.display_message("[SYSTEM] Đã kết nối thành công!")
-
-                # Hiện khung fingerprint
-                def show_security():
-                    self.security_frame.grid()
-                self.after(0, show_security)
-            else:
-                self.display_message(f"[ERROR] Handshake thất bại: {msg}")
-                self.client_socket.close()
-                return
-
-            # Bắt đầu lắng nghe tin nhắn
             self.receive_messages()
-            
+
         except Exception as e:
             self.display_message(f"[ERROR] Không thể kết nối: {e}")
 
     def receive_messages(self):
-        buffer = ""
         while True:
             try:
-                data = self.client_socket.recv(2048).decode('utf-8')
-                if not data: break
-                buffer += data
-                
-                while "\n" in buffer:
-                    message, buffer = buffer.split("\n", 1)
-                    # Xử lý tin nhắn (Logic Tuần 5 & 6)
-                    self.process_incoming_message(message)
-                    
+                m = self.proto.recv()
+                self.process_incoming_message(m)
             except Exception as e:
-                print(e)
+                self.display_message(f"[ERROR] Receive loop stopped: {e}")
                 break
 
-    def process_incoming_message(self, message):
-        # Khi cần in ra màn hình, dùng self.display_message()
-        if not message:
+    def process_incoming_message(self, m: dict):
+        """Process incoming message based on message type."""
+        if not m or "type" not in m:
             return
 
-        if message.startswith("NEW_USER:"):
-            _, name, pubkey_b64 = message.split(":", 2)
-            if name != self.username:
-                pubkey_bytes = base64.b64decode(pubkey_b64)
+        msg_type = m["type"]
+        payload = m.get("payload", {})
 
-                # Tính fingerprint hiện tại của public key mới nhận
-                fp = public_key_fingerprint(pubkey_bytes)
+        if msg_type == TYPE_USER_ANNOUNCE:
+            name = payload.get("name")
+            pubkey_b64 = payload.get("pubkey_b64")
 
-                # Trường hợp 1: lần đầu thấy user này -> TOFU, tự tin lần đầu
-                if name not in self.known_keys:
-                    self.known_keys[name] = fp
-                    self.save_known_keys()
-                    # Cảnh báo nhẹ: cho user biết fingerprint để có thể tự check
-                    self.display_message(f"[INFO] {name} vừa online. Fingerprint key: {fp}")
-                    self.display_message(">> Nếu cần an toàn cao, hãy xác minh fingerprint bằng kênh khác.")
-                else:
-                    # Trường hợp 2: đã từng thấy user này trước đây -> kiểm tra fingerprint
-                    old_fp = self.known_keys[name]
-                    if old_fp != fp:
-                        # 1) CẢNH BÁO TRƯỚC ĐÓ: ghi rõ vào khung chat
-                        self.display_message(f"[WARNING] Public key của {name} đã thay đổi!")
-                        self.display_message(f"  - Fingerprint cũ : {old_fp}")
-                        self.display_message(f"  - Fingerprint mới: {fp}")
-                        self.display_message(">> Có thể là tấn công MITM hoặc người đó vừa đổi thiết bị / cài lại app.")
+            if name == self.username:
+                return
 
-                        # 2) POP-UP HỎI CÓ ACCEPT KEY MỚI KHÔNG
-                        accept = messagebox.askyesno(
-                            "Cảnh báo bảo mật",
-                            (
-                                f"Fingerprint của {name} đã thay đổi.\n\n"
-                                f"Cũ : {old_fp}\nMới: {fp}\n\n"
-                                "Nếu bạn ĐÃ xác minh qua kênh khác rằng đây thật sự là key mới của họ,\n"
-                                "hãy chọn 'Yes' để chấp nhận key mới.\n\n"
-                                "Nếu không chắc chắn, hãy chọn 'No' để từ chối (giữ key cũ)."
-                            )
+            if pubkey_b64 is None:
+                # User offline: remove from directory and UI
+                self.display_message(f"[INFO] {name} vừa offline.")
+                if name in self.user_directory:
+                    del self.user_directory[name]
+                if name in self.session_keys:
+                    del self.session_keys[name]
+                if name in self.user_buttons:
+                    self.user_buttons[name].destroy()
+                    del self.user_buttons[name]
+                return
+
+            # User online: TOFU fingerprint logic
+            pubkey_bytes = base64.b64decode(pubkey_b64)
+            fp = public_key_fingerprint(pubkey_bytes)
+
+            if name not in self.known_keys:
+                # First time seeing this user
+                self.known_keys[name] = fp
+                self.save_known_keys()
+                self.display_message(f"[INFO] {name} vừa online. Fingerprint key: {fp}")
+                self.display_message(">> Nếu cần an toàn cao, hãy xác minh fingerprint bằng kênh khác.")
+            else:
+                # Check if fingerprint matches
+                old_fp = self.known_keys[name]
+                if old_fp != fp:
+                    self.display_message(f"[WARNING] Public key của {name} đã thay đổi!")
+                    self.display_message(f"  - Fingerprint cũ : {old_fp}")
+                    self.display_message(f"  - Fingerprint mới: {fp}")
+                    self.display_message(">> Có thể là tấn công MITM hoặc người đó vừa đổi thiết bị / cài lại app.")
+
+                    accept = messagebox.askyesno(
+                        "Cảnh báo bảo mật",
+                        (
+                            f"Fingerprint của {name} đã thay đổi.\n\n"
+                            f"Cũ : {old_fp}\nMới: {fp}\n\n"
+                            "Nếu bạn ĐÃ xác minh qua kênh khác rằng đây thật sự là key mới của họ,\n"
+                            "hãy chọn 'Yes' để chấp nhận key mới.\n\n"
+                            "Nếu không chắc chắn, hãy chọn 'No' để từ chối (giữ key cũ)."
                         )
+                    )
 
-                        if accept:
-                            # Người dùng CHỦ ĐỘNG chấp nhận: cập nhật fingerprint + public key
-                            self.known_keys[name] = fp
-                            self.save_known_keys()
-                            self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
-                            self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
-                            self.add_user_button(name)
-                        else:
-                            # Từ chối key mới: KHÔNG update public key, không thêm nút chat
-                            self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
-                        return  # Quan trọng: kết thúc xử lý NEW_USER ở đây
+                    if accept:
+                        self.known_keys[name] = fp
+                        self.save_known_keys()
+                        self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+                        self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
+                        self.add_user_button(name)
+                    else:
+                        self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
+                    return
 
-                # Nếu fingerprint ổn (lần đầu hoặc khớp fingerprint cũ) -> lưu public key, thêm vào danh bạ
-                self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
-                self.display_message(f"[INFO] {name} vừa online.")
-                self.add_user_button(name)
+            # Save public key and add to user list
+            self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+            self.display_message(f"[INFO] {name} vừa online.")
+            self.add_user_button(name)
 
-
-        # SERVER đã chuẩn hóa format:~
-        #   SESSION_OFFER:<sender_name_thực>:<encrypted_key_b64>
-        # nên GUI không cần quan tâm client khác gửi gì lên server,
-        # chỉ cần tin sender_name và content từ server.
-
-        elif message.startswith("SESSION_OFFER:"):
+        elif msg_type == TYPE_SESSION_OFFER:
             try:
-                _, sender_name, encrypted_key_b64 = message.split(":", 2)
+                sender_name = payload.get("from")
+                encrypted_key_b64 = payload.get("encrypted_key_b64")
+
                 encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
                 aes_key = rsa_decrypt(encrypted_key_bytes, self.my_private_key)
                 self.session_keys[sender_name] = aes_key
-                self.display_message(f"[SECURE] Đã thiết lập khóa E2EE với {sender_name}.")
-                
-                # [UX UPDATE] Nếu đang mở cửa sổ chat với người này, cập nhật label
-                if self.current_chat_partner == sender_name:
-                    self.logo_label.configure(text=f"Chat với: {sender_name} (🔒)", text_color="green")
-                
-                # Dù đang chọn ai, luôn sync lại header
+
+                self.display_message(f"[SECURE] Đã thiết lập / cập nhật khóa E2EE với {sender_name}.")
+                # Chỉ cập nhật header bên phải (không làm sidebar nhảy chữ)
                 self.update_chat_header()
-        
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý SESSION_OFFER: {e}")
-                
-        elif message.startswith("PRIVATE_MSG:"):
+
+        elif msg_type == TYPE_PRIVATE_MSG:
             try:
-                _, sender_name, encrypted_content_b64 = message.split(":", 2)
+                sender_name = payload.get("from")
+                ciphertext_b64 = payload.get("ciphertext_b64")
+
                 if sender_name not in self.session_keys:
                     self.display_message(f"[INFO] Nhận tin nhắn mã hóa từ {sender_name} nhưng chưa có khóa. Hãy kết nối trước.")
                     return
+
                 session_key = self.session_keys[sender_name]
-                encrypted_bytes = base64.b64decode(encrypted_content_b64)
+                encrypted_bytes = base64.b64decode(ciphertext_b64)
                 decrypted_text = aes_decrypt(encrypted_bytes, session_key)
+
                 if decrypted_text:
                     self.display_message(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
                 else:
                     self.display_message(f"[ERROR] Không thể giải mã tin nhắn từ {sender_name}.")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý PRIVATE_MSG: {e}")
 
-        elif message.startswith("<"): # Chat thường
-            self.display_message(message)
-        
+        elif msg_type == TYPE_BROADCAST:
+            try:
+                sender_name = payload.get("from")
+                text = payload.get("text")
+                self.display_message(f"<{sender_name}>: {text}")
+            except Exception as e:
+                self.display_message(f"[ERROR] Lỗi xử lý BROADCAST: {e}")
+
         else:
-            self.display_message(f"[UNKNOWN] {message}")
+            self.display_message(f"[UNKNOWN] Loại tin nhắn không xác định: {msg_type}")
             
     def send_message_event(self):
         msg = self.entry_message.get()
@@ -557,7 +554,7 @@ class ChatApp(ctk.CTk):
         if target == "Broadcast":
             # Gửi tin nhắn công khai
             try:
-                self.client_socket.send((msg + "\n").encode("utf-8"))
+                self.proto.send_broadcast(msg)
             except Exception as e:  # noqa: BLE001
                 self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn broadcast: {e}")
         else:
@@ -570,8 +567,7 @@ class ChatApp(ctk.CTk):
                         self.display_message("[ERROR] Mã hóa thất bại, không gửi tin nhắn.")
                         return
                     encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
-                    final_msg = f"PRIVATE_MSG:{target}:{encrypted_b64}\n"
-                    self.client_socket.send(final_msg.encode('utf-8'))
+                    self.proto.send_private_msg(target, encrypted_b64)
                     self.display_message(f"Me (to {target}) 🔒: {msg}")
                 except Exception as e:  # noqa: BLE001
                     self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn: {e}")
@@ -598,22 +594,21 @@ class ChatApp(ctk.CTk):
     # [FIX] Cập nhật hàm chọn chat partner
     def select_chat_partner(self, name):
         self.current_chat_partner = name
-        
+
         if name not in self.session_keys:
-            self.logo_label.configure(text=f"Đang kết nối: {name}...", text_color="orange")
             self.display_message(f"[SYSTEM] Đang thiết lập mã hóa E2EE với {name}...")
             self.perform_handshake(name)
         else:
-            self.logo_label.configure(text=f"Chat với: {name} (🔒)", text_color="green")
             self.display_message(f"--- Đã chuyển sang chế độ chat an toàn với {name} ---")
-        # Cập nhật tiêu đề khung chat và trạng thái nút Re-key
+
+        # Chỉ cập nhật header bên phải
         self.update_chat_header()
-        
+
     def select_broadcast(self):
         """Chuyển về phòng chat chung (Broadcast), không mã hóa E2EE."""
         self.current_chat_partner = "Broadcast"
         # Cập nhật tiêu đề bên trái cho dễ nhìn
-        self.logo_label.configure(text="DANH BẠ - Chat chung", text_color="white")
+        # self.logo_label.configure(text="DANH BẠ - Chat chung", text_color="white")
         self.display_message("--- Đã chuyển sang phòng chat chung (Broadcast) ---")
         self.update_chat_header()
                
@@ -627,21 +622,27 @@ class ChatApp(ctk.CTk):
             return
         if target_name in self.session_keys:
             self.display_message(f"[INFO] Đã có khóa với {target_name}.")
+            self.update_chat_header()
             return
 
         try:
             target_pubkey_obj = self.user_directory[target_name]
             aes_key = generate_aes_key()
             encrypted_aes_key = rsa_encrypt(aes_key, target_pubkey_obj)
+
+            # Lưu key local trước (để bạn có thể mã hóa ngay lập tức nếu muốn)
             self.session_keys[target_name] = aes_key
 
-            encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
-            offer_message = f"SESSION_OFFER:{target_name}:{self.username}:{encrypted_key_b64}\n"
-            self.client_socket.sendall(offer_message.encode('utf-8'))
+            encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode("utf-8")
+            self.proto.send_session_offer(target_name, encrypted_key_b64)
+
             self.display_message(f"[SYSTEM] Đã gửi lời mời E2EE đến {target_name}.")
+            # FIX: cập nhật header + enable Re-key nếu đang chat với user này
+            self.update_chat_header()
+
         except Exception as e:  # noqa: BLE001
             self.display_message(f"[ERROR] Lỗi khi bắt tay với {target_name}: {e}")
-      
+
     def rekey_current_session(self):
         """Đổi lại AES key cho phiên chat hiện tại (GUI-only)."""
         target = self.current_chat_partner
@@ -669,9 +670,7 @@ class ChatApp(ctk.CTk):
             self.session_keys[target] = aes_key  # cập nhật key mới
 
             encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode("utf-8")
-            offer_message = f"SESSION_OFFER:{target}:{self.username}:{encrypted_key_b64}\n"
-            self.client_socket.sendall(offer_message.encode("utf-8"))
-
+            self.proto.send_session_offer(target, encrypted_key_b64)
             self.display_message(f"[SYSTEM] Đã Re-key E2EE với {target}.")
             # Sau khi re-key, chắc chắn đang có khóa
             self.update_chat_header()
