@@ -53,6 +53,18 @@ class TestCryptoUtils(unittest.TestCase):
         self.assertEqual(fp1, fp2)
         self.assertEqual(len(fp1), 16)
 
+
+    def test_session_confirm_token_deterministic(self):
+        key = cu.generate_aes_key()
+        sid = "session-123"
+        t1 = cu.session_confirm_token(key, sid)
+        t2 = cu.session_confirm_token(key, sid)
+        self.assertEqual(t1, t2)
+        self.assertEqual(len(t1), 32)
+
+        t3 = cu.session_confirm_token(key, "session-456")
+        self.assertNotEqual(t1, t3)
+
     def test_generate_or_load_keys_create_then_load(self):
         with tempfile.TemporaryDirectory() as td:
             old_cwd = os.getcwd()

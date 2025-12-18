@@ -62,6 +62,7 @@ TYPE_PUBKEY = "PUBKEY"
 
 TYPE_USER_ANNOUNCE = "USER_ANNOUNCE"      # server -> clients
 TYPE_SESSION_OFFER = "SESSION_OFFER"      # client -> server -> target
+TYPE_SESSION_ACK = "SESSION_ACK"          # target -> server -> initiator
 TYPE_PRIVATE_MSG = "PRIVATE_MSG"          # client -> server -> target
 TYPE_BROADCAST = "BROADCAST"              # client -> server -> all
 
@@ -80,8 +81,21 @@ def m_pubkey(pubkey_b64: str) -> Dict[str, Any]:
 def m_broadcast(text: str) -> Dict[str, Any]:
     return {"type": TYPE_BROADCAST, "payload": {"text": text}}
 
-def m_session_offer(to: str, encrypted_key_b64: str) -> Dict[str, Any]:
-    return {"type": TYPE_SESSION_OFFER, "to": to, "payload": {"encrypted_key_b64": encrypted_key_b64}}
+def m_session_offer(to: str, session_id: str, encrypted_key_b64: str) -> Dict[str, Any]:
+    return {
+        "type": TYPE_SESSION_OFFER,
+        "to": to,
+        "payload": {"session_id": session_id, "encrypted_key_b64": encrypted_key_b64},
+    }
+
+
+
+def m_session_ack(to: str, session_id: str, confirm_hex: str) -> Dict[str, Any]:
+    return {
+        "type": TYPE_SESSION_ACK,
+        "to": to,
+        "payload": {"session_id": session_id, "confirm_hex": confirm_hex},
+    }
 
 def m_private_msg(to: str, ciphertext_b64: str) -> Dict[str, Any]:
     return {"type": TYPE_PRIVATE_MSG, "to": to, "payload": {"ciphertext_b64": ciphertext_b64}}

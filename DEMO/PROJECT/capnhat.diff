@@ -1,0 +1,342 @@
+*** a/client_gui.py
+--- b/client_gui.py
+***************
+*** 1,12 ****
+  import socket
+  import threading
+  import customtkinter as ctk
+  import base64
+  from datetime import datetime
+  from tkinter import messagebox
+  
+  import os
+  import json
+***************
+*** 60,65 ****
+  class ChatApp(ctk.CTk):
+      def __init__(self):
+          super().__init__()
+  
+          # 1. Cấu hình cửa sổ chính
+          self.title("Secure Chat E2EE")
+          self.geometry("900x600")
+--- 60,104 ----
+  class ChatApp(ctk.CTk):
+      def __init__(self):
+          super().__init__()
++ 
++         # ---- Thread-safe UI helpers ----
++         # Tkinter/CustomTkinter chỉ an toàn khi thao tác UI ở main thread.
++         # Dùng self.ui(...) để chuyển mọi thao tác UI về main loop.
++         # (Bạn nói bạn vừa tạo hàm ui, nhưng mình vẫn đặt ở đây để đảm bảo đúng vị trí.)
++         # Nếu bạn đã có sẵn hàm ui ở chỗ khác thì giữ một bản duy nhất.
++         #
++         # Usage:
++         #   self.ui(self.add_user_button, name)
++         #   self.ui(btn.destroy)
++         #
++ 
++         # 1. Cấu hình cửa sổ chính
++         self.title("Secure Chat E2EE")
++         self.geometry("900x600")
++ 
++         # ... phần còn lại không đổi ...
++ 
++     def ui(self, fn, *args, **kwargs):
++         """Chạy hàm fn trên main thread (Tkinter event loop)."""
++         try:
++             self.after(0, lambda: fn(*args, **kwargs))
++         except Exception:
++             # Nếu app đang đóng, after có thể fail; bỏ qua.
++             pass
++ 
++     def ask_yesno_threadsafe(self, title: str, msg: str) -> bool:
++         """
++         Hiển thị messagebox.askyesno trên main thread nhưng cho phép thread receive chờ kết quả.
++         Tránh crash do gọi messagebox từ thread phụ.
++         """
++         ev = threading.Event()
++         result = {"value": False}
++ 
++         def _ask():
++             try:
++                 result["value"] = messagebox.askyesno(title, msg)
++             except Exception:
++                 result["value"] = False
++             finally:
++                 ev.set()
++ 
++         self.ui(_ask)
++         ev.wait()  # chờ user bấm Yes/No
++         return bool(result["value"])
+***************
+*** 217,230 ****
+      def start_socket(self, name, public_key_bytes):
+          HOST = '127.0.0.1'
+          PORT = 12345
+          try:
+              self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              self.client_socket.connect((HOST, PORT))
+              self.proto = ProtoClient(self.client_socket)
+  
+              # Handshake theo protocol (dùng ProtoClient)
+              m = self.proto.recv()
+--- 256,269 ----
+      def start_socket(self, name, public_key_bytes):
+          HOST = '127.0.0.1'
+          PORT = 12345
+          try:
+              self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              self.client_socket.connect((HOST, PORT))
+              self.proto = ProtoClient(self.client_socket)
+  
+              # Handshake theo protocol (dùng ProtoClient)
+              m = self.proto.recv()
+***************
+*** 271,278 ****
+              self.proto.send_pubkey(pubkey_b64)
+  
+              self.display_message("[SYSTEM] Đã kết nối thành công!")
+-             self.after(0, lambda: self.security_frame.grid())
++             self.ui(self.security_frame.grid)
+  
+              self.receive_messages()
+  
+          except Exception as e:
+              self.display_message(f"[ERROR] Không thể kết nối: {e}")
+***************
+*** 299,399 ****
+      def process_incoming_message(self, m: dict):
+          """Process incoming message based on message type."""
+          if not m or "type" not in m:
+              return
+  
+          msg_type = m["type"]
+          payload = m.get("payload", {})
+  
+          if msg_type == TYPE_USER_ANNOUNCE:
+              name = payload.get("name")
+              pubkey_b64 = payload.get("pubkey_b64")
+  
+              if name == self.username:
+                  return
+  
+              if pubkey_b64 is None:
+                  # User offline: remove from directory and UI
+                  self.display_message(f"[INFO] {name} vừa offline.")
+                  if name in self.user_directory:
+                      del self.user_directory[name]
+                  if name in self.session_keys:
+                      del self.session_keys[name]
+-                 if name in self.user_buttons:
+-                     self.user_buttons[name].destroy()
+-                     del self.user_buttons[name]
++ 
++                 # UI destroy phải chạy main thread để tránh TclError
++                 def _remove_user_ui():
++                     btn = self.user_buttons.pop(name, None)
++                     if btn is not None:
++                         try:
++                             if btn.winfo_exists():
++                                 btn.destroy()
++                         except Exception:
++                             pass
++                     # Nếu đang chat với user vừa offline thì chuyển về Broadcast
++                     if self.current_chat_partner == name:
++                         self.current_chat_partner = "Broadcast"
++                         self.update_chat_header()
++ 
++                 self.ui(_remove_user_ui)
+                  return
+  
+              # User online: TOFU fingerprint logic
+              pubkey_bytes = base64.b64decode(pubkey_b64)
+              fp = public_key_fingerprint(pubkey_bytes)
+  
+              if name not in self.known_keys:
+                  # First time seeing this user
+                  self.known_keys[name] = fp
+                  self.save_known_keys()
+                  self.display_message(f"[INFO] {name} vừa online. Fingerprint key: {fp}")
+                  self.display_message(">> Nếu cần an toàn cao, hãy xác minh fingerprint bằng kênh khác.")
+              else:
+                  # Check if fingerprint matches
+                  old_fp = self.known_keys[name]
+                  if old_fp != fp:
+                      self.display_message(f"[WARNING] Public key của {name} đã thay đổi!")
+                      self.display_message(f"  - Fingerprint cũ : {old_fp}")
+                      self.display_message(f"  - Fingerprint mới: {fp}")
+                      self.display_message(">> Có thể là tấn công MITM hoặc người đó vừa đổi thiết bị / cài lại app.")
+  
+-                     accept = messagebox.askyesno(
+-                         "Cảnh báo bảo mật",
+-                         (
+-                             f"Fingerprint của {name} đã thay đổi.\n\n"
+-                             f"Cũ : {old_fp}\nMới: {fp}\n\n"
+-                             "Nếu bạn ĐÃ xác minh qua kênh khác rằng đây thật sự là key mới của họ,\n"
+-                             "hãy chọn 'Yes' để chấp nhận key mới.\n\n"
+-                             "Nếu không chắc chắn, hãy chọn 'No' để từ chối (giữ key cũ)."
+-                         )
+-                     )
++                     # askyesno phải thread-safe (main thread)
++                     accept = self.ask_yesno_threadsafe(
++                         "Cảnh báo bảo mật",
++                         (
++                             f"Fingerprint của {name} đã thay đổi.\n\n"
++                             f"Cũ : {old_fp}\nMới: {fp}\n\n"
++                             "Nếu bạn ĐÃ xác minh qua kênh khác rằng đây thật sự là key mới của họ,\n"
++                             "hãy chọn 'Yes' để chấp nhận key mới.\n\n"
++                             "Nếu không chắc chắn, hãy chọn 'No' để từ chối (giữ key cũ)."
++                         )
++                     )
+  
+                      if accept:
+                          self.known_keys[name] = fp
+                          self.save_known_keys()
+                          self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+                          self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
+-                         self.add_user_button(name)
++                         self.ui(self.add_user_button, name)
+                      else:
+                          self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
+                      return
+  
+              # Save public key and add to user list
+              self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+              self.display_message(f"[INFO] {name} vừa online.")
+-             self.add_user_button(name)
++             self.ui(self.add_user_button, name)
+  
+          elif msg_type == TYPE_SESSION_OFFER:
+              try:
+                  sender_name = payload.get("from")
+                  encrypted_key_b64 = payload.get("encrypted_key_b64")
+  
+                  encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
+                  aes_key = rsa_decrypt(encrypted_key_bytes, self.my_private_key)
+                  self.session_keys[sender_name] = aes_key
+  
+                  self.display_message(f"[SECURE] Đã thiết lập / cập nhật khóa E2EE với {sender_name}.")
+                  # Chỉ cập nhật header bên phải (không làm sidebar nhảy chữ)
+-                 self.update_chat_header()
++                 self.ui(self.update_chat_header)
+              except Exception as e:
+                  self.display_message(f"[ERROR] Lỗi xử lý SESSION_OFFER: {e}")
+  
+          elif msg_type == TYPE_PRIVATE_MSG:
+              try:
+                  sender_name = payload.get("from")
+                  ciphertext_b64 = payload.get("ciphertext_b64")
+  
+                  if sender_name not in self.session_keys:
+                      self.display_message(f"[INFO] Nhận tin nhắn mã hóa từ {sender_name} nhưng chưa có khóa. Hãy kết nối trước.")
+                      return
+--- 390,505 ----
+      def process_incoming_message(self, m: dict):
+          """Process incoming message based on message type."""
+          if not m or "type" not in m:
+              return
+  
+          msg_type = m["type"]
+          payload = m.get("payload", {})
+  
+          if msg_type == TYPE_USER_ANNOUNCE:
+              name = payload.get("name")
+              pubkey_b64 = payload.get("pubkey_b64")
+  
+              if name == self.username:
+                  return
+  
+              if pubkey_b64 is None:
+                  # User offline: remove from directory and UI
+                  self.display_message(f"[INFO] {name} vừa offline.")
+                  if name in self.user_directory:
+                      del self.user_directory[name]
+                  if name in self.session_keys:
+                      del self.session_keys[name]
+  
+                  # UI destroy phải chạy main thread để tránh TclError
+                  def _remove_user_ui():
+                      btn = self.user_buttons.pop(name, None)
+                      if btn is not None:
+                          try:
+                              if btn.winfo_exists():
+                                  btn.destroy()
+                          except Exception:
+                              pass
+                      # Nếu đang chat với user vừa offline thì chuyển về Broadcast
+                      if self.current_chat_partner == name:
+                          self.current_chat_partner = "Broadcast"
+                          self.update_chat_header()
+  
+                  self.ui(_remove_user_ui)
+                  return
+  
+              # User online: TOFU fingerprint logic
+              pubkey_bytes = base64.b64decode(pubkey_b64)
+              fp = public_key_fingerprint(pubkey_bytes)
+  
+              if name not in self.known_keys:
+                  # First time seeing this user
+                  self.known_keys[name] = fp
+                  self.save_known_keys()
+                  self.display_message(f"[INFO] {name} vừa online. Fingerprint key: {fp}")
+                  self.display_message(">> Nếu cần an toàn cao, hãy xác minh fingerprint bằng kênh khác.")
+              else:
+                  # Check if fingerprint matches
+                  old_fp = self.known_keys[name]
+                  if old_fp != fp:
+                      self.display_message(f"[WARNING] Public key của {name} đã thay đổi!")
+                      self.display_message(f"  - Fingerprint cũ : {old_fp}")
+                      self.display_message(f"  - Fingerprint mới: {fp}")
+                      self.display_message(">> Có thể là tấn công MITM hoặc người đó vừa đổi thiết bị / cài lại app.")
+  
+                      # askyesno phải thread-safe (main thread)
+                      accept = self.ask_yesno_threadsafe(
+                          "Cảnh báo bảo mật",
+                          (
+                              f"Fingerprint của {name} đã thay đổi.\n\n"
+                              f"Cũ : {old_fp}\nMới: {fp}\n\n"
+                              "Nếu bạn ĐÃ xác minh qua kênh khác rằng đây thật sự là key mới của họ,\n"
+                              "hãy chọn 'Yes' để chấp nhận key mới.\n\n"
+                              "Nếu không chắc chắn, hãy chọn 'No' để từ chối (giữ key cũ)."
+                          )
+                      )
+  
+                      if accept:
+                          self.known_keys[name] = fp
+                          self.save_known_keys()
+                          self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+                          self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
+                          self.ui(self.add_user_button, name)
+                      else:
+                          self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
+                      return
+  
+              # Save public key and add to user list
+              self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
+              self.display_message(f"[INFO] {name} vừa online.")
+              self.ui(self.add_user_button, name)
+  
+          elif msg_type == TYPE_SESSION_OFFER:
+              try:
+                  sender_name = payload.get("from")
+                  encrypted_key_b64 = payload.get("encrypted_key_b64")
+  
+                  encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
+                  aes_key = rsa_decrypt(encrypted_key_bytes, self.my_private_key)
+                  self.session_keys[sender_name] = aes_key
+  
+                  self.display_message(f"[SECURE] Đã thiết lập / cập nhật khóa E2EE với {sender_name}.")
+                  self.ui(self.update_chat_header)
+              except Exception as e:
+                  self.display_message(f"[ERROR] Lỗi xử lý SESSION_OFFER: {e}")
+  
+          elif msg_type == TYPE_PRIVATE_MSG:
+              try:
+                  sender_name = payload.get("from")
+                  ciphertext_b64 = payload.get("ciphertext_b64")
+  
+                  if sender_name not in self.session_keys:
+                      self.display_message(f"[INFO] Nhận tin nhắn mã hóa từ {sender_name} nhưng chưa có khóa. Hãy kết nối trước.")
+                      return

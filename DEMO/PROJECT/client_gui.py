@@ -7,6 +7,7 @@ from tkinter import messagebox
 
 import os
 import json
+import uuid
 
 # Import các hàm mã hóa của bạn
 from crypto_utils import (
@@ -15,12 +16,13 @@ from crypto_utils import (
     aes_encrypt, aes_decrypt,
     load_public_key_from_bytes,
     public_key_fingerprint,
-    generate_or_load_keys
+    generate_or_load_keys,
+    session_confirm_token
 )
 
 from protocol import (
     TYPE_NAME_REQ, TYPE_AUTH_REQ, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ,
-    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_PRIVATE_MSG, TYPE_BROADCAST
+    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_BROADCAST
 )
 
 from transport import ProtoClient
@@ -133,13 +135,16 @@ class ChatApp(ctk.CTk):
         # Thêm các biến quản lý logic E2EE
         self.user_directory = {} # {name: public_key}
         self.session_keys = {}   # {name: aes_key}
+        self.session_confirmed = {}  # {name: bool}
+        self.pending_session_acks = {}  # {(name, session_id): aes_key}
         self.my_private_key = None
         
         # Biến chọn người đang chat
         self.current_chat_partner = "Broadcast" # Mặc định chat chung
         self.user_buttons = {} # [FIX] Thêm dictionary để quản lý nút bấm
         # Cập nhật header chat ban đầu
-        self.update_chat_header()
+        self.ui(self.update_chat_header)
+
         
         # Biến quản lý fingerprint đã biết (TOFU)
         self.known_keys = {}  # {name: fingerprint}
@@ -174,6 +179,45 @@ class ChatApp(ctk.CTk):
         )
         self.view_partner_fp_btn.pack(fill="x", pady=(0, 5))
 
+    def remove_user_button(self, name: str) -> None:
+        """Xóa nút user khỏi sidebar (PHẢI gọi qua self.ui)."""
+        btn = self.user_buttons.pop(name, None)
+        if btn is not None:
+            try:
+                btn.destroy()
+            except Exception:
+                # Tránh crash nếu widget đã bị destroy ở nơi khác
+                pass
+
+    def ui(self, fn, *args, **kwargs):
+        try:
+            self.after(0, lambda: fn(*args, **kwargs))
+        except Exception:
+            pass
+
+    def ask_yesno_threadsafe(self, title: str, message: str) -> bool:
+        """
+        Hiển thị messagebox.askyesno an toàn thread.
+        Thread receive sẽ chờ kết quả, UI không bị crash.
+        """
+        import threading
+        from tkinter import messagebox
+
+        event = threading.Event()
+        result = {"value": False}
+
+        def _ask():
+            try:
+                result["value"] = messagebox.askyesno(title, message)
+            except Exception:
+                result["value"] = False
+            finally:
+                event.set()
+
+        self.ui(_ask)
+        event.wait()
+        return result["value"]
+
     def update_chat_header(self):
         """Cập nhật tiêu đề khung chat và trạng thái nút Re-key."""
         partner = self.current_chat_partner
@@ -185,8 +229,11 @@ class ChatApp(ctk.CTk):
 
         # Đang chat riêng
         if partner in self.session_keys:
-            # Đã có khóa E2EE với partner này
-            self.chat_title_label.configure(text=f"Chat với: {partner} (🔒)")
+            confirmed = self.session_confirmed.get(partner, False)
+            if confirmed:
+                self.chat_title_label.configure(text=f"Chat với: {partner} (🔒)")
+            else:
+                self.chat_title_label.configure(text=f"Chat với: {partner} (🔒 chưa ACK)")
             self.rekey_button.configure(state="normal")
         else:
             # Chưa có khóa / đang thiết lập
@@ -411,7 +458,7 @@ class ChatApp(ctk.CTk):
             self.proto.send_pubkey(pubkey_b64)
 
             self.display_message("[SYSTEM] Đã kết nối thành công!")
-            self.after(0, lambda: self.security_frame.grid())
+            self.ui(self.security_frame.grid)
 
             self.receive_messages()
 
@@ -443,15 +490,27 @@ class ChatApp(ctk.CTk):
                 return
 
             if pubkey_b64 is None:
-                # User offline: remove from directory and UI
+                # User offline: remove from directory and UI (thread-safe)
                 self.display_message(f"[INFO] {name} vừa offline.")
-                if name in self.user_directory:
-                    del self.user_directory[name]
-                if name in self.session_keys:
-                    del self.session_keys[name]
-                if name in self.user_buttons:
-                    self.user_buttons[name].destroy()
-                    del self.user_buttons[name]
+
+                # Xóa dữ liệu liên quan
+                self.user_directory.pop(name, None)
+                self.session_keys.pop(name, None)
+                self.session_confirmed.pop(name, None)
+
+                # Drop pending ACKs liên quan
+                for k in list(self.pending_session_acks.keys()):
+                    if k[0] == name:
+                        self.pending_session_acks.pop(k, None)
+
+                # Xóa nút UI trên main thread
+                self.ui(self.remove_user_button, name)
+
+                # Nếu đang chat với user vừa offline -> quay về Broadcast để UI không “đụng” session cũ
+                if self.current_chat_partner == name:
+                    self.current_chat_partner = "Broadcast"
+                    self.ui(self.update_chat_header)
+
                 return
 
             # User online: TOFU fingerprint logic
@@ -473,7 +532,7 @@ class ChatApp(ctk.CTk):
                     self.display_message(f"  - Fingerprint mới: {fp}")
                     self.display_message(">> Có thể là tấn công MITM hoặc người đó vừa đổi thiết bị / cài lại app.")
 
-                    accept = messagebox.askyesno(
+                    accept = self.ask_yesno_threadsafe(
                         "Cảnh báo bảo mật",
                         (
                             f"Fingerprint của {name} đã thay đổi.\n\n"
@@ -489,7 +548,7 @@ class ChatApp(ctk.CTk):
                         self.save_known_keys()
                         self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
                         self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
-                        self.add_user_button(name)
+                        self.ui(self.add_user_button, name)
                     else:
                         self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
                     return
@@ -497,22 +556,70 @@ class ChatApp(ctk.CTk):
             # Save public key and add to user list
             self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
             self.display_message(f"[INFO] {name} vừa online.")
-            self.add_user_button(name)
+            self.ui(self.add_user_button, name)
 
         elif msg_type == TYPE_SESSION_OFFER:
             try:
                 sender_name = payload.get("from")
+                session_id = payload.get("session_id")
                 encrypted_key_b64 = payload.get("encrypted_key_b64")
+
+                if not sender_name or not session_id or not encrypted_key_b64:
+                    self.display_message(f"[ERROR] SESSION_OFFER không hợp lệ: {m}")
+                    return
 
                 encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
                 aes_key = rsa_decrypt(encrypted_key_bytes, self.my_private_key)
-                self.session_keys[sender_name] = aes_key
 
-                self.display_message(f"[SECURE] Đã thiết lập / cập nhật khóa E2EE với {sender_name}.")
-                # Chỉ cập nhật header bên phải (không làm sidebar nhảy chữ)
-                self.update_chat_header()
+                self.session_keys[sender_name] = aes_key
+                self.session_confirmed[sender_name] = True
+
+                # Send ACK back to initiator
+                confirm_hex = session_confirm_token(aes_key, session_id)
+                self.proto.send_session_ack(sender_name, session_id, confirm_hex)
+
+                self.display_message(
+                    f"[SECURE] Đã thiết lập / cập nhật khóa E2EE với {sender_name} (session_id={session_id})."
+                )
+                self.display_message(f"[SECURE] Đã gửi ACK xác nhận khóa cho {sender_name}.")
+                # Chỉ cập nhật header bên phải
+                self.ui(self.update_chat_header)
+
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý SESSION_OFFER: {e}")
+
+        elif msg_type == TYPE_SESSION_ACK:
+            try:
+                sender_name = payload.get("from")
+                session_id = payload.get("session_id")
+                confirm_hex = payload.get("confirm_hex")
+
+                if not sender_name or not session_id or not confirm_hex:
+                    self.display_message(f"[ERROR] SESSION_ACK không hợp lệ: {m}")
+                    return
+
+                key = self.pending_session_acks.pop((sender_name, session_id), None)
+                if key is None:
+                    self.display_message(
+                        f"[INFO] Nhận ACK từ {sender_name} nhưng không tìm thấy pending session_id={session_id}."
+                    )
+                    return
+
+                expected = session_confirm_token(key, session_id)
+                if expected != confirm_hex:
+                    self.display_message(
+                        f"[WARNING] ACK của {sender_name} KHÔNG khớp (session_id={session_id})."
+                    )
+                    return
+
+                self.session_confirmed[sender_name] = True
+                self.display_message(
+                    f"[SECURE] {sender_name} đã ACK thành công. Kênh E2EE được xác nhận (session_id={session_id})."
+                )
+                self.ui(self.update_chat_header)
+
+            except Exception as e:
+                self.display_message(f"[ERROR] Lỗi xử lý SESSION_ACK: {e}")
 
         elif msg_type == TYPE_PRIVATE_MSG:
             try:
@@ -602,7 +709,8 @@ class ChatApp(ctk.CTk):
             self.display_message(f"--- Đã chuyển sang chế độ chat an toàn với {name} ---")
 
         # Chỉ cập nhật header bên phải
-        self.update_chat_header()
+        self.ui(self.update_chat_header)
+
 
     def select_broadcast(self):
         """Chuyển về phòng chat chung (Broadcast), không mã hóa E2EE."""
@@ -610,7 +718,8 @@ class ChatApp(ctk.CTk):
         # Cập nhật tiêu đề bên trái cho dễ nhìn
         # self.logo_label.configure(text="DANH BẠ - Chat chung", text_color="white")
         self.display_message("--- Đã chuyển sang phòng chat chung (Broadcast) ---")
-        self.update_chat_header()
+        self.ui(self.update_chat_header)
+
                
     def perform_handshake(self, target_name):
         """Tạo AES key, mã hóa bằng RSA của target và gửi SESSION_OFFER."""
@@ -622,7 +731,8 @@ class ChatApp(ctk.CTk):
             return
         if target_name in self.session_keys:
             self.display_message(f"[INFO] Đã có khóa với {target_name}.")
-            self.update_chat_header()
+            self.ui(self.update_chat_header)
+
             return
 
         try:
@@ -634,11 +744,15 @@ class ChatApp(ctk.CTk):
             self.session_keys[target_name] = aes_key
 
             encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode("utf-8")
-            self.proto.send_session_offer(target_name, encrypted_key_b64)
+            session_id = uuid.uuid4().hex
+            self.pending_session_acks[(target_name, session_id)] = aes_key
+            self.session_confirmed[target_name] = False
+            self.proto.send_session_offer(target_name, session_id, encrypted_key_b64)
 
             self.display_message(f"[SYSTEM] Đã gửi lời mời E2EE đến {target_name}.")
             # FIX: cập nhật header + enable Re-key nếu đang chat với user này
-            self.update_chat_header()
+            self.ui(self.update_chat_header)
+
 
         except Exception as e:  # noqa: BLE001
             self.display_message(f"[ERROR] Lỗi khi bắt tay với {target_name}: {e}")
@@ -670,10 +784,14 @@ class ChatApp(ctk.CTk):
             self.session_keys[target] = aes_key  # cập nhật key mới
 
             encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode("utf-8")
-            self.proto.send_session_offer(target, encrypted_key_b64)
+            session_id = uuid.uuid4().hex
+            self.pending_session_acks[(target, session_id)] = aes_key
+            self.session_confirmed[target] = False
+            self.proto.send_session_offer(target, session_id, encrypted_key_b64)
             self.display_message(f"[SYSTEM] Đã Re-key E2EE với {target}.")
             # Sau khi re-key, chắc chắn đang có khóa
-            self.update_chat_header()
+            self.ui(self.update_chat_header)
+
 
         except Exception as e:  # noqa: BLE001
             self.display_message(f"[ERROR] Lỗi khi Re-key với {target}: {e}")

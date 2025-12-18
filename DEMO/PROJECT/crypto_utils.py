@@ -178,4 +178,25 @@ def public_key_fingerprint(pubkey_bytes: bytes, length: int = 16) -> str:
     full = digest.finalize().hex()
     return full[:length]
 
+
+def session_confirm_token(aes_key: bytes, session_id: str, length: int = 32) -> str:
+    """Generate a deterministic confirmation token for SESSION_ACK verification.
+
+    The token proves the receiver successfully decrypted the same AES key
+    without revealing the key itself.
+
+    length: number of hex characters to return (default 32 = 128 bits).
+    """
+    if not isinstance(aes_key, (bytes, bytearray)):
+        raise TypeError("aes_key must be bytes")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id must be a non-empty string")
+
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    digest.update(bytes(aes_key))
+    digest.update(session_id.encode("utf-8"))
+    digest.update(b"|SESSION_ACK|v1")
+    full = digest.finalize().hex()
+    return full[:length]
+
 # END OF FILE

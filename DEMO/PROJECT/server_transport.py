@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 from protocol import (
-    send_msg, recv_msg,
-    TYPE_ERROR, TYPE_BROADCAST, TYPE_PRIVATE_MSG, TYPE_SESSION_OFFER, TYPE_USER_ANNOUNCE
+    send_msg,
+    recv_msg,
+    TYPE_ERROR,
+    TYPE_BROADCAST,
+    TYPE_PRIVATE_MSG,
+    TYPE_SESSION_OFFER,
+    TYPE_SESSION_ACK,
+    TYPE_USER_ANNOUNCE,
 )
+
 
 class ProtoPeer:
     """Server-side protocol adapter for one connected socket."""
+
     def __init__(self, sock):
         self.sock = sock
 
@@ -29,29 +37,18 @@ class ProtoPeer:
     def forward_private(self, sender: str, ciphertext_b64: str) -> None:
         self.send({"type": TYPE_PRIVATE_MSG, "payload": {"from": sender, "ciphertext_b64": ciphertext_b64}})
 
-    def forward_session_offer(self, sender: str, encrypted_key_b64: str) -> None:
-        self.send({"type": TYPE_SESSION_OFFER, "payload": {"from": sender, "encrypted_key_b64": encrypted_key_b64}})
+    def forward_session_offer(self, sender: str, session_id: str, encrypted_key_b64: str) -> None:
+        self.send(
+            {
+                "type": TYPE_SESSION_OFFER,
+                "payload": {"from": sender, "session_id": session_id, "encrypted_key_b64": encrypted_key_b64},
+            }
+        )
 
-# Example usage in server.py:
-# peer = ProtoPeer(sock)
-# msg = peer.recv()
-# peer.send_broadcast_from(sender_name, text)
-# peer.send_error("Some error message")
-# peer.forward_private(sender_name, ciphertext_b64)
-# peer.forward_session_offer(sender_name, encrypted_key_b64)
-# peer.send_user_announce(name, pubkey_b64)
-# Then replace direct socket operations with peer methods.
-
-# In server.py, you would replace direct socket operations with ProtoPeer methods.
-
-# Example replacement in server.py:
-# peer = ProtoPeer(sock)    
-# m = peer.recv()
-# peer.send_broadcast_from(sender_name, text)
-# peer.send_error(f"User '{target_name}' not online")
-# peer.forward_private(sender_name, ciphertext_b64)
-# peer.forward_session_offer(sender_name, encrypted_key_b64)
-# peer.send_user_announce(name, pubkey_b64)
-# This encapsulates the protocol logic and makes server.py cleaner.
-
-# Note: The actual integration into server.py is not shown here, as per the instruction to only provide the completed code snippet.
+    def forward_session_ack(self, sender: str, session_id: str, confirm_hex: str) -> None:
+        self.send(
+            {
+                "type": TYPE_SESSION_ACK,
+                "payload": {"from": sender, "session_id": session_id, "confirm_hex": confirm_hex},
+            }
+        )

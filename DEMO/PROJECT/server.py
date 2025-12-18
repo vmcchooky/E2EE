@@ -7,7 +7,7 @@ import json
 import hashlib
 
 # import all methods in protocol.py
-from protocol import TYPE_NAME_REQ, TYPE_NAME, TYPE_AUTH_REQ, TYPE_AUTH, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ, TYPE_PUBKEY, TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_PRIVATE_MSG, TYPE_BROADCAST
+from protocol import TYPE_NAME_REQ, TYPE_NAME, TYPE_AUTH_REQ, TYPE_AUTH, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ, TYPE_PUBKEY, TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_BROADCAST
 from server_transport import ProtoPeer
 
 AUTH_FILE = "Users/auth_users.json"
@@ -193,16 +193,32 @@ def handle_client(sock: socket.socket) -> None:
 
             elif t == TYPE_SESSION_OFFER:
                 target_name = m.get("to") or m.get("payload", {}).get("to")
+                session_id = m.get("payload", {}).get("session_id")
                 encrypted_key_b64 = m.get("payload", {}).get("encrypted_key_b64")
-                if not target_name or not encrypted_key_b64:
-                    peer.send_error("SESSION_OFFER missing 'to' or 'encrypted_key_b64'")
+                if not target_name or not session_id or not encrypted_key_b64:
+                    peer.send_error("SESSION_OFFER missing 'to', 'session_id' or 'encrypted_key_b64'")
                     continue
 
                 target_socket = _find_socket_by_name(target_name)
                 if target_socket:
-                    ProtoPeer(target_socket).forward_session_offer(sender_name, encrypted_key_b64)
+                    ProtoPeer(target_socket).forward_session_offer(sender_name, session_id, encrypted_key_b64)
                 else:
                     peer.send_error(f"User '{target_name}' not online")
+            elif t == TYPE_SESSION_ACK:
+                target_name = m.get("to") or m.get("payload", {}).get("to")
+                session_id = m.get("payload", {}).get("session_id")
+                confirm_hex = m.get("payload", {}).get("confirm_hex")
+
+                if not target_name or not session_id or not confirm_hex:
+                    peer.send_error("SESSION_ACK missing 'to', 'session_id' or 'confirm_hex'")
+                    continue
+
+                target_socket = _find_socket_by_name(target_name)
+                if target_socket:
+                    ProtoPeer(target_socket).forward_session_ack(sender_name, session_id, confirm_hex)
+                else:
+                    peer.send_error(f"User '{target_name}' not online")
+
 
             else:
                 peer.send_error("Unsupported message type")
@@ -223,6 +239,8 @@ def handle_client(sock: socket.socket) -> None:
                 removed = True
 
         if removed and name:
+            # Notify others to drop directory/session state for this user
+            broadcast({"type": TYPE_USER_ANNOUNCE, "payload": {"name": name, "pubkey_b64": None}})
             broadcast({"type": TYPE_BROADCAST, "payload": {"from": "SERVER", "text": f"User '{name}' disconnected."}})
 
 def start_server() -> None:

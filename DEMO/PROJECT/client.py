@@ -6,6 +6,7 @@ import base64
 from getpass import getpass
 import time
 import json
+import uuid
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
@@ -21,11 +22,12 @@ from crypto_utils import (
     rsa_encrypt,
     generate_or_load_keys,
     public_key_fingerprint,
+    session_confirm_token,
 )
 
 from protocol import (
     TYPE_NAME_REQ, TYPE_AUTH_REQ, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ,
-    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_PRIVATE_MSG, TYPE_BROADCAST
+    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_BROADCAST
 )
 from transport import ProtoClient
 
@@ -37,6 +39,8 @@ my_name = ""
 my_private_key = None  # store private key object
 user_directory = {}   # {"Alice": <public_key_obj>}
 session_keys = {}     # {"Alice": <aes_key_bytes>}
+session_confirmed = {}  # {"Alice": bool}  (initiator-side: confirmed via SESSION_ACK)
+pending_session_acks = {}  # {(peer_name, session_id): aes_key_bytes}
 last_rekey_time = {}  # {"Alice": timestamp}
 REKEY_SUGGEST_INTERVAL = 300   # 5 phút -> gợi ý re-key
 
@@ -76,7 +80,12 @@ def receive_messages(proto: ProtoClient) -> None:
                     print(f"[INFO] {name} vua offline.")
                     user_directory.pop(name, None)
                     session_keys.pop(name, None)
+                    session_confirmed.pop(name, None)
                     last_rekey_time.pop(name, None)
+                    # Drop any pending ACKs involving this peer
+                    for k in list(pending_session_acks.keys()):
+                        if k[0] == name:
+                            pending_session_acks.pop(k, None)
                     continue
 
                 if name == my_name:
@@ -103,12 +112,55 @@ def receive_messages(proto: ProtoClient) -> None:
 
             elif t == TYPE_SESSION_OFFER:
                 sender_name = m["payload"]["from"]
+                session_id = m["payload"].get("session_id")
                 encrypted_key_b64 = m["payload"]["encrypted_key_b64"]
+
+                if not session_id:
+                    print(f"[LOI] SESSION_OFFER tu {sender_name} thieu session_id, bo qua.")
+                    continue
+
                 encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
                 aes_key = rsa_decrypt(encrypted_key_bytes, my_private_key)
+
                 session_keys[sender_name] = aes_key
+                session_confirmed[sender_name] = True
                 last_rekey_time[sender_name] = time.time()
-                print(f"[HE THONG] Da thiet lap / cap nhat phien E2EE voi {sender_name}.")
+
+                # Send ACK to confirm receiver decrypted the same key
+                confirm_hex = session_confirm_token(aes_key, session_id)
+                proto.send_session_ack(sender_name, session_id, confirm_hex)
+
+                print(f"[HE THONG] Da thiet lap / cap nhat phien E2EE voi {sender_name} (session_id={session_id}).")
+                print(f"[HE THONG] Da gui ACK xac nhan khoa cho {sender_name}.")
+
+            elif t == TYPE_SESSION_ACK:
+                sender_name = m["payload"].get("from")
+                session_id = m["payload"].get("session_id")
+                confirm_hex = m["payload"].get("confirm_hex")
+
+                if not sender_name or not session_id or not confirm_hex:
+                    print(f"[LOI] SESSION_ACK khong hop le: {m}")
+                    continue
+
+                key = pending_session_acks.pop((sender_name, session_id), None)
+                if key is None:
+                    print(
+                        f"[INFO] Nhan SESSION_ACK tu {sender_name} nhung khong tim thay pending session_id={session_id}."
+                    )
+                    continue
+
+                expected = session_confirm_token(key, session_id)
+                if expected != confirm_hex:
+                    print(
+                        f"[CANH BAO] SESSION_ACK tu {sender_name} KHONG KHOP (session_id={session_id})."
+                    )
+                    continue
+
+                session_confirmed[sender_name] = True
+                last_rekey_time[sender_name] = time.time()
+                print(
+                    f"[HE THONG] {sender_name} da ACK thanh cong. Kenh E2EE da duoc xac nhan (session_id={session_id})."
+                )
 
             elif t == TYPE_PRIVATE_MSG:
                 sender_name = m["payload"]["from"]
@@ -276,7 +328,10 @@ def start_client() -> None:
                 last_rekey_time[target_name] = time.time()
 
                 encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
-                proto.send_session_offer(target_name, encrypted_key_b64)
+                session_id = uuid.uuid4().hex
+                pending_session_acks[(target_name, session_id)] = aes_key
+                session_confirmed[target_name] = False
+                proto.send_session_offer(target_name, session_id, encrypted_key_b64)
                 print(f"[HE THONG] Da gui loi moi E2EE den {target_name}.")
 
             elif message.startswith("/chat "):
@@ -296,6 +351,9 @@ def start_client() -> None:
                     if last_t and (time.time() - last_t > REKEY_SUGGEST_INTERVAL):
                         print(f"[INFO] Phien E2EE voi {target_name} da dung lau, "
                               f"ban nen re-key (GUI co nut Re-key, hoac tu mo rong CLI).")
+
+                    if not session_confirmed.get(target_name, False):
+                        print(f"[INFO] Phien voi {target_name} chua duoc ACK xac nhan. Tin nhan van co the gui, nhung nen doi ACK de dam bao doi phuong da nhan khoa.")
 
                     session_key = session_keys[target_name]
                     encrypted_bytes = aes_encrypt(plain_content.encode('utf-8'), session_key)

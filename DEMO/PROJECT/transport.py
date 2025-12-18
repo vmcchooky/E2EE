@@ -1,7 +1,7 @@
 # transport.py
 from protocol import (
     send_msg, recv_msg,
-    m_name, m_auth, m_pubkey, m_broadcast, m_private_msg, m_session_offer
+    m_name, m_auth, m_pubkey, m_broadcast, m_private_msg, m_session_offer, m_session_ack
 )
 
 class ProtoClient:
@@ -26,8 +26,11 @@ class ProtoClient:
     def send_private_msg(self, to: str, ciphertext_b64: str) -> None:
         send_msg(self.sock, m_private_msg(to, ciphertext_b64))
 
-    def send_session_offer(self, to: str, encrypted_key_b64: str) -> None:
-        send_msg(self.sock, m_session_offer(to, encrypted_key_b64))
+    def send_session_offer(self, to: str, session_id: str, encrypted_key_b64: str) -> None:
+        send_msg(self.sock, m_session_offer(to, session_id, encrypted_key_b64))
+
+    def send_session_ack(self, to: str, session_id: str, confirm_hex: str) -> None:
+        send_msg(self.sock, m_session_ack(to, session_id, confirm_hex))
 
 # Example usage in client.py:
 # peer = ProtoClient(sock)
