@@ -5,10 +5,62 @@ import sys
 import os
 import json
 import hashlib
+import hmac
+import secrets
+import time
+import ssl
+
 
 # import all methods in protocol.py
 from protocol import TYPE_NAME_REQ, TYPE_NAME, TYPE_AUTH_REQ, TYPE_AUTH, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ, TYPE_PUBKEY, TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_BROADCAST
 from server_transport import ProtoPeer
+
+# ---- Password hashing (PBKDF2-HMAC-SHA256) ----
+_PBKDF2_ITERS = 200_000
+_SALT_LEN = 16
+_DK_LEN = 32
+
+def _hash_password_pbkdf2(password: str, *, salt: bytes | None = None, iters: int = _PBKDF2_ITERS) -> dict:
+    if salt is None:
+        salt = secrets.token_bytes(_SALT_LEN)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters, dklen=_DK_LEN)
+    return {
+        "kdf": "pbkdf2_sha256",
+        "i": int(iters),
+        "s": base64.b64encode(salt).decode("ascii"),
+        "h": base64.b64encode(dk).decode("ascii"),
+    }
+
+def _verify_password(password: str, stored) -> tuple[bool, bool]:
+    """
+    Returns (ok, is_legacy_sha256)
+    - legacy format: stored is a hex string sha256(password)
+    - new format: stored is dict {kdf,i,s,h}
+    """
+    if stored is None:
+        return False, False
+
+    # Legacy: sha256 hex string
+    if isinstance(stored, str):
+        candidate = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(stored, candidate), True
+
+    if not isinstance(stored, dict):
+        return False, False
+
+    if stored.get("kdf") != "pbkdf2_sha256":
+        return False, False
+
+    try:
+        iters = int(stored["i"])
+        salt = base64.b64decode(stored["s"])
+        want = base64.b64decode(stored["h"])
+    except Exception:
+        return False, False
+
+    got = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters, dklen=len(want))
+    return hmac.compare_digest(want, got), False
+# ---- Server State ----
 
 AUTH_FILE = "Users/auth_users.json"
 user_db = {}  # {name: password_hash}
@@ -131,14 +183,21 @@ def handle_client(sock: socket.socket) -> None:
             peer.send_error("Password cannot be empty")
             return
 
-        password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        stored_hash = user_db.get(name)
-        if stored_hash is None:
-            user_db[name] = password_hash
+        stored = user_db.get(name)
+        if stored is None:
+            # First login: create account
+            user_db[name] = _hash_password_pbkdf2(password)
             save_user_db()
-        elif stored_hash != password_hash:
-            peer.send_error("Authentication failed")
-            return
+        else:
+            ok, is_legacy = _verify_password(password, stored)
+            if not ok:
+                peer.send_error("Authentication failed")
+                return
+
+            # Auto-migrate legacy SHA256 -> PBKDF2 once user logs in successfully
+            if is_legacy:
+                user_db[name] = _hash_password_pbkdf2(password)
+                save_user_db()
 
         peer.send({"type": TYPE_AUTH_OK, "payload": {}})
         print(f"[AUTH] User '{name}' authenticated OK.")
@@ -244,17 +303,21 @@ def handle_client(sock: socket.socket) -> None:
             broadcast({"type": TYPE_BROADCAST, "payload": {"from": "SERVER", "text": f"User '{name}' disconnected."}})
 
 def start_server() -> None:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile="../certs/server_cert.pem", keyfile="../certs/server_key.pem")
+    
     server_socket.bind((HOST, PORT))
     server_socket.listen()
-    print(f"Server dang lang nghe tren {HOST}:{PORT}")
+    print(f"Server dang lang nghe tren {HOST}:{PORT} (TLS)")
     print("Go 'quit' hoac 'exit' va nhan Enter de tat server.")
 
     while server_running:
         try:
             server_socket.settimeout(1.0)
-            sock, address = server_socket.accept()
-            print(f"Ket noi moi tu {str(address)}")
+            raw_sock, address = server_socket.accept()
+            sock = context.wrap_socket(raw_sock, server_side=True)
 
+            print(f"Ket noi moi tu {str(address)}")
             thread = threading.Thread(target=handle_client, args=(sock,))
             thread.daemon = True
             thread.start()

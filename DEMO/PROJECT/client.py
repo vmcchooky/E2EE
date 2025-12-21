@@ -7,6 +7,7 @@ from getpass import getpass
 import time
 import json
 import uuid
+import ssl
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
@@ -168,7 +169,8 @@ def receive_messages(proto: ProtoClient) -> None:
                 if sender_name in session_keys:
                     session_key = session_keys[sender_name]
                     encrypted_bytes = base64.b64decode(encrypted_content_b64)
-                    decrypted_text = aes_decrypt(encrypted_bytes, session_key)
+                    aad = f"{sender_name}|{my_name}".encode("utf-8")
+                    decrypted_text = aes_decrypt(encrypted_bytes, session_key, associated_data=aad)
                     if decrypted_text:
                         print(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
                     else:
@@ -195,26 +197,29 @@ def start_client() -> None:
     PORT = 12345
 
     try:
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.connect((HOST, PORT))
+        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        context = ssl.create_default_context(cafile="../certs/server_cert.pem")
+        sock = context.wrap_socket(raw, server_hostname="SecureChatDev")
+        sock.connect((HOST, PORT))
     except ConnectionRefusedError:
         print("Khong the ket noi den server. Server co dang chay khong?")
         return
-    proto = ProtoClient(client_socket)
-    
+
+    proto = ProtoClient(sock)
+
     load_known_keys()
 
     try:
         m = proto.recv()
         if m["type"] != TYPE_NAME_REQ:
             print(f"[ERROR] Expected NAME_REQ, got {m}")
-            client_socket.close()
+            sock.close()
             return
 
         name = input("Nhap ten cua ban: ").strip()
         if not name:
             print("[ERROR] Name cannot be empty")
-            client_socket.close()
+            sock.close()
             return
 
         proto.send_name(name)
@@ -225,11 +230,11 @@ def start_client() -> None:
         m = proto.recv()
         if m["type"] == TYPE_ERROR:
             print(f"[ERROR] {m['payload']['message']}")
-            client_socket.close()
+            sock.close()
             return
         if m["type"] != TYPE_AUTH_REQ:
             print(f"[ERROR] Expected AUTH_REQ, got {m}")
-            client_socket.close()
+            sock.close()
             return
 
         server_pwd = getpass("Nhap mat khau dang nhap server (lan dau se dung de dang ky): ")
@@ -238,11 +243,11 @@ def start_client() -> None:
         m = proto.recv()
         if m["type"] == TYPE_ERROR:
             print(f"[AUTH] That bai: {m['payload']['message']}")
-            client_socket.close()
+            sock.close()
             return
         if m["type"] != TYPE_AUTH_OK:
             print(f"[AUTH] Khong hop le: {m}")
-            client_socket.close()
+            sock.close()
             return
         print("[AUTH] Xac thuc voi server thanh cong.")
 
@@ -271,18 +276,18 @@ def start_client() -> None:
         my_private_key = private_key
         if not private_key:
             print("Khong the xu ly khoa (co the sai mat khau). Dang thoat...")
-            client_socket.close()
+            sock.close()
             return
 
         # PUBKEY
         m = proto.recv()
         if m["type"] == TYPE_ERROR:
             print(f"[ERROR] {m['payload']['message']}")
-            client_socket.close()
+            sock.close()
             return
         if m["type"] != TYPE_PUBKEY_REQ:
             print(f"[ERROR] Expected PUBKEY_REQ, got {m}")
-            client_socket.close()
+            sock.close()
             return
 
         pubkey_b64 = base64.b64encode(public_key_bytes).decode("utf-8")
@@ -291,7 +296,7 @@ def start_client() -> None:
 
     except Exception as e:  # noqa: BLE001
         print(f"Loi trong qua trinh thiet lap ket noi: {e}")
-        client_socket.close()
+        sock.close()
         return
 
     receive_thread = threading.Thread(target=receive_messages, args=(proto,))
@@ -356,7 +361,9 @@ def start_client() -> None:
                         print(f"[INFO] Phien voi {target_name} chua duoc ACK xac nhan. Tin nhan van co the gui, nhung nen doi ACK de dam bao doi phuong da nhan khoa.")
 
                     session_key = session_keys[target_name]
-                    encrypted_bytes = aes_encrypt(plain_content.encode('utf-8'), session_key)
+                    aad = f"{my_name}|{target_name}".encode("utf-8")
+                    encrypted_bytes = aes_encrypt(plain_content.encode("utf-8"), session_key, associated_data=aad)
+                    
                     if encrypted_bytes is None:
                         print("[LOI] Ma hoa that bai, khong gui tin nhan.")
                         continue
@@ -374,7 +381,7 @@ def start_client() -> None:
     except KeyboardInterrupt:
         print("\nDang thoat...")
     finally:
-        client_socket.close()
+        sock.close()
         print("Da ngat ket noi khoi server.")
         sys.exit(0)
 

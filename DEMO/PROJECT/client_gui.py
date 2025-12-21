@@ -8,6 +8,7 @@ from tkinter import messagebox
 import os
 import json
 import uuid
+import ssl
 
 # Import các hàm mã hóa của bạn
 from crypto_utils import (
@@ -408,14 +409,22 @@ class ChatApp(ctk.CTk):
         self.connect_btn.configure(state="disabled")
 
     def start_socket(self, name, public_key_bytes):
-        HOST = '127.0.0.1'
+        HOST = "127.0.0.1"
         PORT = 12345
         try:
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((HOST, PORT))
+            raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            # TLS verify server cert
+            context = ssl.create_default_context(cafile="../certs/server_cert.pem")
+            # (mặc định check_hostname=True trong create_default_context)
+            tls_sock = context.wrap_socket(raw, server_hostname="SecureChatDev")
+            tls_sock.connect((HOST, PORT))
+
+            # Lưu socket đúng biến, dùng thống nhất
+            self.client_socket = tls_sock
             self.proto = ProtoClient(self.client_socket)
 
-            # Handshake theo protocol (dùng ProtoClient)
+            # Handshake theo protocol
             m = self.proto.recv()
             if m["type"] != TYPE_NAME_REQ:
                 self.display_message(f"[ERROR] Expected NAME_REQ, got {m}")
@@ -464,6 +473,11 @@ class ChatApp(ctk.CTk):
 
         except Exception as e:
             self.display_message(f"[ERROR] Không thể kết nối: {e}")
+            try:
+                if getattr(self, "client_socket", None):
+                    self.client_socket.close()
+            except Exception:
+                pass
 
     def receive_messages(self):
         while True:
@@ -632,7 +646,8 @@ class ChatApp(ctk.CTk):
 
                 session_key = self.session_keys[sender_name]
                 encrypted_bytes = base64.b64decode(ciphertext_b64)
-                decrypted_text = aes_decrypt(encrypted_bytes, session_key)
+                aad = f"{sender_name}|{self.username}".encode("utf-8")
+                decrypted_text = aes_decrypt(encrypted_bytes, session_key, associated_data=aad)
 
                 if decrypted_text:
                     self.display_message(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
@@ -669,7 +684,8 @@ class ChatApp(ctk.CTk):
             if target in self.session_keys:
                 try:
                     session_key = self.session_keys[target]
-                    encrypted_bytes = aes_encrypt(msg.encode('utf-8'), session_key)
+                    aad = f"{self.username}|{target}".encode("utf-8")
+                    encrypted_bytes = aes_encrypt(msg.encode("utf-8"), session_key, associated_data=aad)
                     if encrypted_bytes is None:
                         self.display_message("[ERROR] Mã hóa thất bại, không gửi tin nhắn.")
                         return
