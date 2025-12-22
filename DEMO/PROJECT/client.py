@@ -145,8 +145,6 @@ def receive_messages(proto: ProtoClient) -> None:
                 session_keys[sender_name] = aes_key
                 session_confirmed[sender_name] = True
                 last_rekey_time[sender_name] = time.time()
-                send_ctr[sender_name] = 0
-                recv_ctr[sender_name] = 0
 
                 confirm_hex = session_confirm_token(aes_key, session_id)
                 proto.send_session_ack(sender_name, session_id, confirm_hex)
@@ -177,12 +175,8 @@ def receive_messages(proto: ProtoClient) -> None:
                     )
                     continue
 
-                session_keys[sender_name] = key
                 session_confirmed[sender_name] = True
                 last_rekey_time[sender_name] = time.time()
-                send_ctr[sender_name] = 0
-                recv_ctr[sender_name] = 0
-
                 print(
                     f"[HE THONG] {sender_name} da ACK thanh cong. Kenh E2EE da duoc xac nhan (session_id={session_id})."
                 )
@@ -408,23 +402,16 @@ def start_client() -> None:
                         print(f"[INFO] Phien voi {target_name} chua duoc ACK xac nhan. Tin nhan van co the gui, nhung nen doi ACK de dam bao doi phuong da nhan khoa.")
 
                     session_key = session_keys[target_name]
-                    # Anti-replay counter
-                    ctr = int(send_ctr.get(target_name, 0)) + 1
-                    aad = f"{my_name}|{target_name}|{ctr}".encode("utf-8")
-
-                    encrypted_bytes = aes_encrypt(
-                        plain_content.encode("utf-8"),
-                        session_key,
-                        associated_data=aad
-                    )
+                    aad = f"{my_name}|{target_name}".encode("utf-8")
+                    encrypted_bytes = aes_encrypt(plain_content.encode("utf-8"), session_key, associated_data=aad)
+                    
                     if encrypted_bytes is None:
                         print("[LOI] Ma hoa that bai, khong gui tin nhan.")
                         continue
+                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
 
-                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode("utf-8")
+                    proto.send_private_msg(target_name, encrypted_b64)
 
-                    proto.send_private_msg(target_name, encrypted_b64, ctr)
-                    send_ctr[target_name] = ctr
                     print(f"[DA GUI] toi {target_name}: {plain_content}")
 
                 except Exception as e:  # noqa: BLE001

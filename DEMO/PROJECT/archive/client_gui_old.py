@@ -11,8 +11,6 @@ import uuid
 import ssl
 import time
 
-from typing import Optional
-
 # Import các hàm mã hóa của bạn
 from crypto_utils import (
     generate_aes_key, 
@@ -44,139 +42,54 @@ ctk.set_appearance_mode("Dark")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
 
 class ChatApp(ctk.CTk):
-
     def __init__(self):
         super().__init__()
 
-        ctk.set_appearance_mode("dark")  # "dark" | "light" | "system"
-        ctk.set_default_color_theme("blue")
-
+        # 1. Cấu hình cửa sổ chính
         self.title("Secure Chat E2EE")
-        self.geometry("1100x720")
-        self.minsize(980, 640)
+        self.geometry("900x600")
 
-        # ===== State =====
-        self.username = ""
-        self.client_socket = None
-        self.server_password = None
+        # 2. Layout: Chia lưới 2 cột (1 cột danh sách user, 1 cột chat)
+        self.grid_columnconfigure(1, weight=1)
+        # Hàng 0: header chat (không mở rộng)
+        self.grid_rowconfigure(0, weight=0)
+        # Hàng 1: khung chat (mở rộng theo chiều dọc)
+        self.grid_rowconfigure(1, weight=1)
+        # Hàng 2: input (không mở rộng)
+        self.grid_rowconfigure(2, weight=0)
 
-        # E2EE state
-        self.user_directory = {}            # {name: public_key_bytes}
-        self.session_keys = {}              # {name: aes_key}
-        self.session_confirmed = {}         # {name: bool}
-        self.session_ids = {}               # {name: session_id}
-        self.pending_session_keys = {}      # {name: aes_key}
-        self.pending_session_ids = {}       # {name: session_id}
-        self.session_offers = {}            # {name: {session_id, aes_key, timestamp}}
-        self.known_keys = {}                # {name: fingerprint_str}
-        self.peer_trust = {}                # {name: "TOFU"|"VERIFIED"|"CHANGED"}
+        # --- CỘT TRÁI: DANH SÁCH USER ---
+        self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(4, weight=1)
 
-        self.send_ctr = {}                  # {name: int}
-        self.recv_ctr = {}                  # {name: int}
-        self.out_msg_count = {}             # {name: int}
-        self.last_rekey_time = {}           # {name: float}
+        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="DANH BẠ", font=ctk.CTkFont(size=20, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
-        self.current_chat_partner = "Broadcast"
-
-        # UI conversation state
-        self.chat_history = {"Broadcast": []}   # {conv_id: [message_dict]}
-        self.unread = {"Broadcast": 0}
-        self.conversation_widgets = {}          # {conv_id: {"root": frame, ...}}
-        self.user_buttons = {}                  # kept for compatibility; maps to root frames
-
-        # Files / persistence
-        # NOTE: cần set trước khi gọi load_known_keys()
-        self.known_keys_file = "FingerPrint/known_keys_gui.json"
-
-        # Pending session ACKs (initiator side) - map (peer, session_id) -> aes_key
-        # (Trong code có dùng self.pending_session_acks; nếu không init sẽ crash khi chạy)
-        self.pending_session_acks = {}
-
-        # Known key cache
-        self.load_known_keys()
-
-        # ===== Layout grid =====
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=0)  # sidebar
-        self.grid_columnconfigure(1, weight=1)  # main
-
-        # ===== Sidebar =====
-        self.sidebar = ctk.CTkFrame(self, width=320, corner_radius=0)
-        self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(2, weight=1)  # conversation list expands
-        self.sidebar.grid_columnconfigure(0, weight=1)
-
-        # Top user strip
-        self.sb_top = ctk.CTkFrame(self.sidebar)
-        self.sb_top.grid(row=0, column=0, padx=14, pady=(14, 10), sticky="ew")
-        self.sb_top.grid_columnconfigure(0, weight=1)
-
-        self.self_name_label = ctk.CTkLabel(
-            self.sb_top,
-            text="Chưa đăng nhập",
-            font=ctk.CTkFont(size=16, weight="bold")
+        # Nơi chứa các nút bấm chọn người chat
+        self.scrollable_user_list = ctk.CTkScrollableFrame(self.sidebar_frame, label_text="Online Users")
+        self.scrollable_user_list.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
+                # Nút cố định để quay lại chat chung (Broadcast)
+        self.broadcast_button = ctk.CTkButton(
+            self.scrollable_user_list,
+            text="Broadcast (All)",
+            command=self.select_broadcast  # gọi hàm riêng, KHÔNG handshake
         )
-        self.self_name_label.grid(row=0, column=0, sticky="w")
+        self.broadcast_button.pack(pady=5, padx=5, fill="x")
 
-        self.conn_status_label = ctk.CTkLabel(
-            self.sb_top,
-            text="Disconnected",
-            font=ctk.CTkFont(size=12)
+        # Nút kết nối thủ công (tạm thời)
+        self.connect_btn = ctk.CTkButton(self.sidebar_frame, text="Connect Server", command=self.connect_server_dialog)
+        self.connect_btn.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+
+        # --- CỘT PHẢI: KHUNG CHAT ---
+
+        # Thanh tiêu đề khung chat (hiển thị partner + nút Re-key)
+        self.chat_header_frame = ctk.CTkFrame(self)
+        self.chat_header_frame.grid(
+            row=0, column=1,
+            padx=(20, 20), pady=(20, 0),
+            sticky="ew"
         )
-        self.conn_status_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
-
-        self.connect_btn = ctk.CTkButton(
-            self.sb_top,
-            text="Connect",
-            width=92,
-            command=self.connect_server_dialog
-        )
-        self.connect_btn.grid(row=0, column=1, rowspan=2, padx=(10, 0), sticky="e")
-
-        # Search
-        self.search_var = ctk.StringVar(value="")
-        self.search_entry = ctk.CTkEntry(
-            self.sidebar,
-            textvariable=self.search_var,
-            placeholder_text="Tìm kiếm cuộc trò chuyện..."
-        )
-        self.search_entry.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
-        self.search_var.trace_add("write", lambda *_: self._apply_search_filter())
-
-        # Conversation list
-        self.scrollable_user_list = ctk.CTkScrollableFrame(
-            self.sidebar,
-            label_text="Chats"
-        )
-        self.scrollable_user_list.grid(row=2, column=0, padx=14, pady=(0, 10), sticky="nsew")
-
-        # Broadcast is always present
-        self._ensure_conversation_tile("Broadcast", subtitle="Phòng chat chung", trust="")
-
-        # Bottom actions
-        self.sb_bottom = ctk.CTkFrame(self.sidebar)
-        self.sb_bottom.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="ew")
-        self.sb_bottom.grid_columnconfigure((0, 1), weight=1)
-
-        self.btn_my_fp = ctk.CTkButton(
-            self.sb_bottom, text="My Fingerprint", command=self.show_self_fingerprint
-        )
-        self.btn_my_fp.grid(row=0, column=0, padx=(0, 6), sticky="ew")
-
-        self.btn_peer_fp = ctk.CTkButton(
-            self.sb_bottom, text="Peer Fingerprint", command=self.show_partner_fingerprint
-        )
-        self.btn_peer_fp.grid(row=0, column=1, padx=(6, 0), sticky="ew")
-
-        # ===== Main pane =====
-        self.main = ctk.CTkFrame(self, corner_radius=0)
-        self.main.grid(row=0, column=1, sticky="nsew")
-        self.main.grid_rowconfigure(1, weight=1)
-        self.main.grid_columnconfigure(0, weight=1)
-
-        # Header
-        self.chat_header_frame = ctk.CTkFrame(self.main)
-        self.chat_header_frame.grid(row=0, column=0, padx=16, pady=(14, 10), sticky="ew")
         self.chat_header_frame.grid_columnconfigure(0, weight=1)
 
         self.chat_title_label = ctk.CTkLabel(
@@ -186,51 +99,100 @@ class ChatApp(ctk.CTk):
         )
         self.chat_title_label.grid(row=0, column=0, sticky="w")
 
-        self.badges_frame = ctk.CTkFrame(self.chat_header_frame, fg_color="transparent")
-        self.badges_frame.grid(row=1, column=0, sticky="w", pady=(6, 0))
-
-        self.badge_tls = ctk.CTkLabel(self.badges_frame, text="TLS: OFF", font=ctk.CTkFont(size=12))
-        self.badge_tls.grid(row=0, column=0, padx=(0, 10), sticky="w")
-
-        self.badge_e2ee = ctk.CTkLabel(self.badges_frame, text="E2EE: N/A", font=ctk.CTkFont(size=12))
-        self.badge_e2ee.grid(row=0, column=1, padx=(0, 10), sticky="w")
-
-        self.badge_id = ctk.CTkLabel(self.badges_frame, text="Identity: N/A", font=ctk.CTkFont(size=12))
-        self.badge_id.grid(row=0, column=2, sticky="w")
-
+        # Nút Re-key: chỉ enable khi đang chat riêng và đã có E2EE
         self.rekey_button = ctk.CTkButton(
             self.chat_header_frame,
             text="Re-key",
-            width=90,
+            width=80,
             command=self.rekey_current_session
         )
-        self.rekey_button.grid(row=0, column=1, rowspan=2, padx=(10, 0), sticky="e")
+        self.rekey_button.grid(row=0, column=1, padx=(10, 0))
         self.rekey_button.configure(state="disabled")
 
-        # Messages
-        self.message_area = ctk.CTkScrollableFrame(self.main, label_text="")
-        self.message_area.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="nsew")
-        self.message_area.grid_columnconfigure(0, weight=1)
+        # --- CỘT PHẢI: KHUNG CHAT ---
+        # Khu vực hiển thị tin nhắn
+        self.chat_display = ctk.CTkTextbox(self, width=250)
+        self.chat_display.grid(
+            row=1, column=1,
+            padx=(20, 20), pady=(10, 0),
+            sticky="nsew"
+        )
 
-        self._msg_row = 0
+        self.chat_display.configure(state="disabled") # Chỉ đọc, không cho gõ trực tiếp vào đây
 
-        # Composer
-        self.input_frame = ctk.CTkFrame(self.main)
-        self.input_frame.grid(row=2, column=0, padx=16, pady=(0, 14), sticky="ew")
-        self.input_frame.grid_columnconfigure(1, weight=1)
+        # Khung chứa ô nhập và nút gửi
+        self.input_frame = ctk.CTkFrame(self)
+        self.input_frame.grid(
+            row=2, column=1,
+            padx=(20, 20), pady=(10, 20),
+            sticky="ew"
+        )
+        self.input_frame.grid_columnconfigure(0, weight=1)
 
-        self.attach_btn = ctk.CTkButton(self.input_frame, text="+", width=42, command=lambda: None)
-        self.attach_btn.grid(row=0, column=0, padx=(10, 8), pady=10)
-
+        # Khu vực nhập tin nhắn
         self.entry_message = ctk.CTkEntry(self.input_frame, placeholder_text="Nhập tin nhắn...")
-        self.entry_message.grid(row=0, column=1, padx=(0, 8), pady=10, sticky="ew")
-        self.entry_message.bind("<Return>", lambda e: (self.send_message_event(), "break"))
+        self.entry_message.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
 
-        self.send_button = ctk.CTkButton(self.input_frame, text="Send", width=90, command=self.send_message_event)
-        self.send_button.grid(row=0, column=2, padx=(0, 10), pady=10, sticky="e")
+        # Nút gửi
+        self.send_button = ctk.CTkButton(self.input_frame, text="Gửi", command=self.send_message_event, width=80)
+        self.send_button.grid(row=0, column=1, pady=0, sticky="e")
 
-        # First header render
-        self.update_chat_header()
+        # Biến trạng thái
+        self.username = ""
+        self.client_socket = None
+        self.server_password = None
+        
+        # Thêm các biến quản lý logic E2EE
+        self.user_directory = {} # {name: public_key}
+        self.session_keys = {}   # {name: aes_key}
+        self.session_confirmed = {}  # {name: bool}
+        self.pending_session_acks = {}  # {(name, session_id): aes_key}
+        # Anti-replay + auto rekey state
+        self.send_ctr = {}         # {peer: last_sent_ctr}
+        self.recv_ctr = {}         # {peer: last_recv_ctr}
+        self.out_msg_count = {}    # {peer: outbound_count_since_rekey}
+        self.last_rekey_time = {}  # {peer: unix_ts}
+        self.my_private_key = None
+
+        # Biến chọn người đang chat
+        self.current_chat_partner = "Broadcast" # Mặc định chat chung
+        self.user_buttons = {} # [FIX] Thêm dictionary để quản lý nút bấm
+        # Cập nhật header chat ban đầu
+        self.ui(self.update_chat_header)
+
+        
+        # Biến quản lý fingerprint đã biết (TOFU)
+        self.known_keys = {}  # {name: fingerprint}
+        self.known_keys_file = "FingerPrint/known_keys_gui.json"
+        self.load_known_keys()
+        
+        # Khung bảo mật (chứa các nút fingerprint) - ẨN LÚC ĐẦU
+        self.security_frame = ctk.CTkFrame(self.sidebar_frame)
+        self.security_frame.grid(row=3, column=0, padx=20, pady=(0, 20), sticky="ew")
+        self.security_frame.grid_remove()  # ẩn đi cho tới khi connect xong
+
+        security_label = ctk.CTkLabel(
+            self.security_frame,
+            text="Bảo mật / Fingerprint",
+            font=ctk.CTkFont(size=14, weight="bold")
+        )
+        security_label.pack(pady=(5, 5))
+
+        # Nút xem fingerprint của chính mình
+        self.view_self_fp_btn = ctk.CTkButton(
+            self.security_frame,
+            text="Fingerprint của tôi",
+            command=self.show_self_fingerprint
+        )
+        self.view_self_fp_btn.pack(fill="x", pady=(0, 5))
+
+        # Nút xem fingerprint của người đang chọn
+        self.view_partner_fp_btn = ctk.CTkButton(
+            self.security_frame,
+            text="Fingerprint người đang chọn",
+            command=self.show_partner_fingerprint
+        )
+        self.view_partner_fp_btn.pack(fill="x", pady=(0, 5))
 
     def remove_user_button(self, name: str) -> None:
         """Xóa nút user khỏi sidebar (PHẢI gọi qua self.ui)."""
@@ -247,210 +209,6 @@ class ChatApp(ctk.CTk):
             self.after(0, lambda: fn(*args, **kwargs))
         except Exception:
             pass
-
-
-
-    # ===== UI helpers (modern layout) =====
-
-    # NOTE: dùng Optional[str] để tương thích Python < 3.10 (tránh cú pháp `str | None`).
-    def _set_connection_ui(self, status: str, detail: Optional[str] = None):
-        # status: "DISCONNECTED"|"CONNECTING"|"CONNECTED"
-        if status == "CONNECTED":
-            self.conn_status_label.configure(text="Connected (TLS)")
-            self.badge_tls.configure(text="TLS: ON")
-            self.connect_btn.configure(state="disabled")
-        elif status == "CONNECTING":
-            self.conn_status_label.configure(text="Connecting...")
-            self.badge_tls.configure(text="TLS: ...")
-            self.connect_btn.configure(state="disabled")
-        else:
-            self.conn_status_label.configure(text=f"Disconnected{': ' + detail if detail else ''}")
-            self.badge_tls.configure(text="TLS: OFF")
-            self.connect_btn.configure(state="normal")
-
-    def _apply_search_filter(self):
-        query = (self.search_var.get() or "").strip().lower()
-        for conv_id, w in self.conversation_widgets.items():
-            title = (w.get("title_text") or "").lower()
-            visible = (query == "") or (query in title)
-            try:
-                if visible:
-                    w["root"].pack(fill="x", padx=6, pady=4)
-                else:
-                    w["root"].pack_forget()
-            except Exception:
-                pass
-
-    def _ensure_conversation_tile(self, conv_id: str, subtitle: str = "", trust: str = ""):
-        if conv_id not in self.chat_history:
-            self.chat_history[conv_id] = []
-        if conv_id not in self.unread:
-            self.unread[conv_id] = 0
-
-        if conv_id in self.conversation_widgets:
-            # update subtitle if provided
-            if subtitle:
-                self.conversation_widgets[conv_id]["subtitle"].configure(text=subtitle)
-            return
-
-        root = ctk.CTkFrame(self.scrollable_user_list)
-        root.pack(fill="x", padx=6, pady=4)
-
-        root.grid_columnconfigure(0, weight=1)
-
-        title = ctk.CTkLabel(root, text=conv_id, font=ctk.CTkFont(size=14, weight="bold"))
-        title.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
-
-        sub = ctk.CTkLabel(root, text=subtitle, font=ctk.CTkFont(size=12))
-        sub.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 8))
-
-        right = ctk.CTkFrame(root, fg_color="transparent")
-        right.grid(row=0, column=1, rowspan=2, sticky="e", padx=10)
-
-        badge = ctk.CTkLabel(right, text=trust, font=ctk.CTkFont(size=11))
-        badge.grid(row=0, column=0, sticky="e")
-
-        unread = ctk.CTkLabel(right, text="", font=ctk.CTkFont(size=11))
-        unread.grid(row=1, column=0, sticky="e", pady=(4, 0))
-
-        def _select(_evt=None, cid=conv_id):
-            if cid == "Broadcast":
-                self.select_broadcast()
-            else:
-                self.select_chat_partner(cid)
-
-        for widget in (root, title, sub, right, badge, unread):
-            widget.bind("<Button-1>", _select)
-
-        self.conversation_widgets[conv_id] = {
-            "root": root,
-            "title": title,
-            "subtitle": sub,
-            "badge": badge,
-            "unread": unread,
-            "title_text": conv_id,
-        }
-        # keep compatibility with existing naming
-        self.user_buttons[conv_id] = root
-
-        self._refresh_conversation_tile(conv_id)
-
-    def _refresh_conversation_tile(self, conv_id: str):
-        w = self.conversation_widgets.get(conv_id)
-        if not w:
-            return
-        # subtitle from last message
-        hist = self.chat_history.get(conv_id, [])
-        if hist:
-            last = hist[-1]
-            preview = last.get("text", "")
-            preview = preview.replace("\n", " ")
-            if len(preview) > 40:
-                preview = preview[:40] + "…"
-            w["subtitle"].configure(text=preview)
-        # unread
-        u = int(self.unread.get(conv_id, 0))
-        w["unread"].configure(text=f"{u} mới" if u > 0 else "")
-        # trust badge
-        if conv_id not in ("Broadcast", ""):
-            t = self.peer_trust.get(conv_id, "TOFU")
-            w["badge"].configure(text=t)
-        else:
-            w["badge"].configure(text="")
-
-    def _clear_message_area(self):
-        for child in self.message_area.winfo_children():
-            try:
-                child.destroy()
-            except Exception:
-                pass
-        self._msg_row = 0
-
-    def _render_conversation(self, conv_id: str):
-        self._clear_message_area()
-        for msg in self.chat_history.get(conv_id, []):
-            self._render_message_bubble(msg)
-        self._scroll_to_bottom()
-
-    def _scroll_to_bottom(self):
-        # CustomTkinter internal canvas; best-effort
-        try:
-            self.update_idletasks()
-            canvas = getattr(self.message_area, "_parent_canvas", None)
-            if canvas is not None:
-                canvas.yview_moveto(1.0)
-        except Exception:
-            pass
-
-    def _render_message_bubble(self, msg: dict):
-        kind = msg.get("kind", "chat")  # "chat"|"system"
-        direction = msg.get("direction", "in")  # "in"|"out"
-        text = msg.get("text", "")
-        meta = msg.get("meta", "")
-
-        row = ctk.CTkFrame(self.message_area, fg_color="transparent")
-        row.grid(row=self._msg_row, column=0, sticky="ew", pady=4, padx=6)
-        row.grid_columnconfigure(0, weight=1)
-        row.grid_columnconfigure(1, weight=1)
-
-        if kind == "system":
-            bubble = ctk.CTkFrame(row)
-            bubble.grid(row=0, column=0, columnspan=2, sticky="ew", padx=120)
-            label = ctk.CTkLabel(bubble, text=text, justify="center", wraplength=600)
-            label.pack(padx=12, pady=(8, 2))
-            if meta:
-                meta_lbl = ctk.CTkLabel(bubble, text=meta, font=ctk.CTkFont(size=11))
-                meta_lbl.pack(padx=12, pady=(0, 8))
-        else:
-            bubble = ctk.CTkFrame(row)
-            col = 1 if direction == "out" else 0
-            sticky = "e" if direction == "out" else "w"
-            bubble.grid(row=0, column=col, sticky=sticky, padx=10)
-            label = ctk.CTkLabel(bubble, text=text, justify="left", wraplength=560)
-            label.pack(padx=12, pady=(8, 2))
-            meta_text = meta
-            if meta_text:
-                meta_lbl = ctk.CTkLabel(bubble, text=meta_text, font=ctk.CTkFont(size=11))
-                meta_lbl.pack(padx=12, pady=(0, 8))
-
-        self._msg_row += 1
-
-    def _append_message(self, conv_id: str, msg: dict, bump_unread_if_inactive: bool = True):
-        if conv_id not in self.chat_history:
-            self.chat_history[conv_id] = []
-        self.chat_history[conv_id].append(msg)
-
-        # Ensure tile exists for peer convs
-        if conv_id != "Broadcast":
-            self._ensure_conversation_tile(conv_id)
-
-        if conv_id != self.current_chat_partner and bump_unread_if_inactive:
-            self.unread[conv_id] = int(self.unread.get(conv_id, 0)) + 1
-        else:
-            self.unread[conv_id] = 0
-
-        self._refresh_conversation_tile(conv_id)
-
-        if conv_id == self.current_chat_partner:
-            self._render_message_bubble(msg)
-            self._scroll_to_bottom()
-
-    def add_system_message(self, text: str, conv_id: Optional[str] = None):
-        conv = conv_id or self.current_chat_partner
-        ts = datetime.now().strftime("%H:%M")
-        self._append_message(conv, {"kind": "system", "text": text, "meta": ts}, bump_unread_if_inactive=False)
-
-    def add_incoming_message(self, sender: str, text: str, encrypted: bool = False, conv_id: Optional[str] = None):
-        conv = conv_id or sender
-        ts = datetime.now().strftime("%H:%M")
-        meta = f"{ts}" + (" • 🔒" if encrypted else "")
-        self._append_message(conv, {"kind": "chat", "direction": "in", "text": text, "meta": meta})
-
-    def add_outgoing_message(self, target: str, text: str, encrypted: bool = False, conv_id: Optional[str] = None):
-        conv = conv_id or target
-        ts = datetime.now().strftime("%H:%M")
-        meta = f"{ts}" + (" • 🔒" if encrypted else "")
-        self._append_message(conv, {"kind": "chat", "direction": "out", "text": text, "meta": meta}, bump_unread_if_inactive=False)
 
     def ask_yesno_threadsafe(self, title: str, message: str) -> bool:
         """
@@ -475,38 +233,26 @@ class ChatApp(ctk.CTk):
         event.wait()
         return result["value"]
 
-
     def update_chat_header(self):
-        """Cập nhật tiêu đề khung chat + badges + trạng thái nút Re-key."""
+        """Cập nhật tiêu đề khung chat và trạng thái nút Re-key."""
         partner = self.current_chat_partner
-
-        # TLS badge
-        tls_on = self.client_socket is not None
-        self.badge_tls.configure(text=f"TLS: {'ON' if tls_on else 'OFF'}")
 
         if partner == "Broadcast":
             self.chat_title_label.configure(text="Chat chung (Broadcast)")
             self.rekey_button.configure(state="disabled")
-            self.badge_e2ee.configure(text="E2EE: OFF")
-            self.badge_id.configure(text="Identity: N/A")
             return
 
-        # Private chat
-        trust = self.peer_trust.get(partner, "TOFU")
-        self.badge_id.configure(text=f"Identity: {trust}")
-
+        # Đang chat riêng
         if partner in self.session_keys:
             confirmed = self.session_confirmed.get(partner, False)
             if confirmed:
                 self.chat_title_label.configure(text=f"Chat với: {partner} (🔒)")
-                self.badge_e2ee.configure(text="E2EE: ON")
             else:
-                self.chat_title_label.configure(text=f"Chat với: {partner} (🔒 đang xác nhận...)")
-                self.badge_e2ee.configure(text="E2EE: NEGOTIATING")
+                self.chat_title_label.configure(text=f"Chat với: {partner} (🔒 chưa ACK)")
             self.rekey_button.configure(state="normal")
         else:
+            # Chưa có khóa / đang thiết lập
             self.chat_title_label.configure(text=f"Chat với: {partner} (đang thiết lập khóa...)")
-            self.badge_e2ee.configure(text="E2EE: SETUP")
             self.rekey_button.configure(state="disabled")
 
     def format_fingerprint(self, fp: str) -> str:
@@ -680,13 +426,10 @@ class ChatApp(ctk.CTk):
         HOST = "127.0.0.1"
         PORT = 12345
         try:
-            self.ui(self._set_connection_ui, "CONNECTING")
             raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-            # TLS verify server cert (dùng path theo vị trí file để không phụ thuộc working directory)
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            ca_path = os.path.normpath(os.path.join(base_dir, "..", "certs", "server_cert.pem"))
-            context = ssl.create_default_context(cafile=ca_path)
+            # TLS verify server cert
+            context = ssl.create_default_context(cafile="../certs/server_cert.pem")
             # (mặc định check_hostname=True trong create_default_context)
             tls_sock = context.wrap_socket(raw, server_hostname="SecureChatDev")
             tls_sock.connect((HOST, PORT))
@@ -700,7 +443,6 @@ class ChatApp(ctk.CTk):
             if m["type"] != TYPE_NAME_REQ:
                 self.display_message(f"[ERROR] Expected NAME_REQ, got {m}")
                 self.client_socket.close()
-                self.ui(self._set_connection_ui, "DISCONNECTED", "Auth failed")
                 return
             self.proto.send_name(name)
 
@@ -738,15 +480,13 @@ class ChatApp(ctk.CTk):
             pubkey_b64 = base64.b64encode(public_key_bytes).decode("utf-8")
             self.proto.send_pubkey(pubkey_b64)
 
-            self.add_system_message("Đã kết nối thành công (TLS).", conv_id="Broadcast")
-            self.ui(self._set_connection_ui, "CONNECTED")
-            self.ui(lambda: self.self_name_label.configure(text=self.username or name))
+            self.display_message("[SYSTEM] Đã kết nối thành công!")
+            self.ui(self.security_frame.grid)
 
             self.receive_messages()
 
         except Exception as e:
             self.display_message(f"[ERROR] Không thể kết nối: {e}")
-            self.ui(self._set_connection_ui, "DISCONNECTED", str(e))
             try:
                 if getattr(self, "client_socket", None):
                     self.client_socket.close()
@@ -837,22 +577,16 @@ class ChatApp(ctk.CTk):
 
                     if accept:
                         self.known_keys[name] = fp
-                        self.peer_trust[name] = "CHANGED"
-                        self._refresh_conversation_tile(name)
                         self.save_known_keys()
                         self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
                         self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
                         self.ui(self.add_user_button, name)
                     else:
-                        self.peer_trust[name] = "CHANGED"
-                        self._refresh_conversation_tile(name)
                         self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
                     return
 
             # Save public key and add to user list
             self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
-            if name not in self.peer_trust:
-                self.peer_trust[name] = "TOFU"
             self.display_message(f"[INFO] {name} vừa online.")
             self.ui(self.add_user_button, name)
 
@@ -966,7 +700,7 @@ class ChatApp(ctk.CTk):
 
                 if decrypted_text:
                     self.recv_ctr[sender_name] = ctr
-                    self.add_incoming_message(sender_name, decrypted_text.decode("utf-8"), encrypted=True)
+                    self.display_message(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
                 else:
                     self.display_message(f"[ERROR] Không thể giải mã tin nhắn từ {sender_name} (ctr={ctr}).")
             except Exception as e:
@@ -976,16 +710,7 @@ class ChatApp(ctk.CTk):
             try:
                 sender_name = payload.get("from")
                 text = payload.get("text")
-
-                if not sender_name:
-                    return
-
-                # Broadcast conversation
-                self._ensure_conversation_tile("Broadcast", subtitle="Phòng chat chung", trust="")
-                if sender_name == self.username:
-                    self.add_outgoing_message("Broadcast", text, encrypted=False, conv_id="Broadcast")
-                else:
-                    self.add_incoming_message(sender_name, text, encrypted=False, conv_id="Broadcast")
+                self.display_message(f"<{sender_name}>: {text}")
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý BROADCAST: {e}")
 
@@ -1002,7 +727,6 @@ class ChatApp(ctk.CTk):
             # Gửi tin nhắn công khai
             try:
                 self.proto.send_broadcast(msg)
-                self.add_outgoing_message("Broadcast", msg, encrypted=False, conv_id="Broadcast")
             except Exception as e:  # noqa: BLE001
                 self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn broadcast: {e}")
         else:
@@ -1031,7 +755,7 @@ class ChatApp(ctk.CTk):
                     # Gửi kèm ctr
                     self.proto.send_private_msg(target, encrypted_b64, ctr)
 
-                    self.add_outgoing_message(target, msg, encrypted=True)
+                    self.display_message(f"Me (to {target}) 🔒: {msg}")
 
                     # track count cho auto rekey
                     self.out_msg_count[target] = self.out_msg_count.get(target, 0) + 1
@@ -1048,38 +772,41 @@ class ChatApp(ctk.CTk):
         self.entry_message.delete(0, "end")
     
     # [FIX] Sửa lại hàm thêm nút user
-
     def add_user_button(self, name):
-        # In modern UI, this creates/updates a conversation tile
-        if not name or name == self.username:
-            return
-        self._ensure_conversation_tile(name)
-        self._apply_search_filter()
+        if name in self.user_buttons:
+            return # Đã có nút này rồi thì bỏ qua
 
+        btn = ctk.CTkButton(
+            self.scrollable_user_list, 
+            text=name,
+            command=lambda n=name: self.select_chat_partner(n)
+        )
+        btn.pack(pady=5, padx=5, fill="x")
+        self.user_buttons[name] = btn # Lưu lại nút
+
+    # [FIX] Cập nhật hàm chọn chat partner
     def select_chat_partner(self, name):
         self.current_chat_partner = name
-        self.unread[name] = 0
-        self._refresh_conversation_tile(name)
-        self._render_conversation(name)
 
         if name not in self.session_keys:
-            self.add_system_message(f"Đang thiết lập mã hóa E2EE với {name}...", conv_id=name)
+            self.display_message(f"[SYSTEM] Đang thiết lập mã hóa E2EE với {name}...")
             self.perform_handshake(name)
         else:
-            self.add_system_message(f"Đã chuyển sang chế độ chat an toàn với {name}.", conv_id=name)
+            self.display_message(f"--- Đã chuyển sang chế độ chat an toàn với {name} ---")
 
+        # Chỉ cập nhật header bên phải
         self.ui(self.update_chat_header)
 
 
     def select_broadcast(self):
         """Chuyển về phòng chat chung (Broadcast), không mã hóa E2EE."""
         self.current_chat_partner = "Broadcast"
-        self.unread["Broadcast"] = 0
-        self._refresh_conversation_tile("Broadcast")
-        self._render_conversation("Broadcast")
-        self.add_system_message("Đã chuyển sang phòng chat chung (Broadcast).", conv_id="Broadcast")
+        # Cập nhật tiêu đề bên trái cho dễ nhìn
+        # self.logo_label.configure(text="DANH BẠ - Chat chung", text_color="white")
+        self.display_message("--- Đã chuyển sang phòng chat chung (Broadcast) ---")
         self.ui(self.update_chat_header)
 
+               
     def perform_handshake(self, target_name):
         """Tạo AES key, mã hóa bằng RSA của target và gửi SESSION_OFFER."""
         if target_name == self.username:
@@ -1208,22 +935,16 @@ class ChatApp(ctk.CTk):
             self.display_message(f"[ERROR] Lỗi khi Re-key với {target}: {e}")
 
     # Trong client_gui.py -> class ChatApp
-
     def display_message(self, text):
-        # Backwards-compatible: route all legacy logs to a system message in the current conversation
-        try:
-            self.after(0, lambda: self.add_system_message(str(text)))
-        except Exception:
-            pass
+        # Dùng self.after để đẩy việc cập nhật UI về luồng chính
+        self.after(0, self._safe_display_message, text)
 
     def _safe_display_message(self, text):
-        # Legacy hook kept for compatibility (no longer writes to a textbox)
-        try:
-            self.add_system_message(str(text))
-        except Exception:
-            pass
-
-
+        """Hàm nội bộ thực sự thực hiện việc in tin nhắn"""
+        self.chat_display.configure(state="normal")
+        self.chat_display.insert("end", text + "\n")
+        self.chat_display.configure(state="disabled")
+        self.chat_display.see("end")
 
 if __name__ == "__main__":
     app = ChatApp()

@@ -32,8 +32,10 @@ from server_transport import ProtoPeer
 HOST = "127.0.0.1"
 PORT = 12345
 
-TLS_CERTFILE = "../certs/server_cert.pem"
-TLS_KEYFILE = "../certs/server_key.pem"
+# Làm đường dẫn cert/key theo vị trí file để tránh phụ thuộc "working directory"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TLS_CERTFILE = os.path.normpath(os.path.join(BASE_DIR, "..", "certs", "server_cert.pem"))
+TLS_KEYFILE = os.path.normpath(os.path.join(BASE_DIR, "..", "certs", "server_key.pem"))
 
 AUTH_FILE = "Users/auth_users.json"
 
@@ -378,7 +380,9 @@ def command_input():
 
 
 def start_server():
-    global server_socket, server_running  # <-- FIX: thêm server_running
+    # IMPORTANT: phải khai báo server_running là global vì ta có gán lại ở finally.
+    # Nếu không, Python sẽ coi server_running là biến local và crash UnboundLocalError.
+    global server_socket, server_running
 
     load_user_db()
 
@@ -390,7 +394,7 @@ def start_server():
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, PORT))
     server_socket.listen()
-    server_socket.settimeout(1.0)
+    server_socket.settimeout(1.0)  # <<< CỐT LÕI GIÚP CTRL+C TẮT ĐƯỢC
 
     print(f"[SERVER] Listening TLS on {HOST}:{PORT}")
     print("[SERVER] Type 'exit' or Ctrl+C to stop.")
@@ -402,7 +406,7 @@ def start_server():
             except socket.timeout:
                 continue
             except OSError:
-                # socket bị close từ thread command_input
+                # server_socket có thể bị close từ thread command_input
                 break
 
             sock = ctx.wrap_socket(raw, server_side=True)
