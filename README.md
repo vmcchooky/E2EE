@@ -66,3 +66,16 @@ python -m venv venv
 deactivate
 ```
 
+# Thêm SSL:
+- Tạo thư mục certs và mở certs, chuột phải "Open with Git BasH"
+- Chạy lệnh sau: 
+> ```bash
+> openssl req -x509 -newkey rsa:2048 -keyout server_key.pem -out server_cert.pem -days 365 -nodes -subj "//CN=SecureChatDev"
+> ```
+- Hoặc chạy lệnh:
+> ```bash
+> openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout server_key.pem -out server_cert.pem -days 365 \
+  -subj "//CN=SecureChatDev" \
+  -addext "subjectAltName=DNS:SecureChatDev,IP:127.0.0.1"
+> ```

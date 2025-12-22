@@ -34,16 +34,33 @@ class ProtoPeer:
     def send_broadcast_from(self, sender: str, text: str) -> None:
         self.send({"type": TYPE_BROADCAST, "payload": {"from": sender, "text": text}})
 
-    def forward_private(self, sender: str, ciphertext_b64: str) -> None:
-        self.send({"type": TYPE_PRIVATE_MSG, "payload": {"from": sender, "ciphertext_b64": ciphertext_b64}})
+    
+    def forward_private(self, sender: str, ciphertext_b64: str, ctr: int) -> None:
+        self.send(
+            {
+                "type": TYPE_PRIVATE_MSG,
+                "payload": {
+                    "from": sender,
+                    "ciphertext_b64": ciphertext_b64,
+                    "ctr": int(ctr),
+                },
+            }
+        )
 
-    def forward_session_offer(self, sender: str, session_id: str, encrypted_key_b64: str) -> None:
+
+    def forward_session_offer(self, sender: str, session_id: str, encrypted_key_b64: str, sig_b64: str) -> None:
         self.send(
             {
                 "type": TYPE_SESSION_OFFER,
-                "payload": {"from": sender, "session_id": session_id, "encrypted_key_b64": encrypted_key_b64},
+                "payload": {
+                    "from": sender,
+                    "session_id": session_id,
+                    "encrypted_key_b64": encrypted_key_b64,
+                    "sig_b64": sig_b64,
+                },
             }
         )
+
 
     def forward_session_ack(self, sender: str, session_id: str, confirm_hex: str) -> None:
         self.send(

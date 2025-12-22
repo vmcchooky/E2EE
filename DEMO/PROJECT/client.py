@@ -24,6 +24,11 @@ from crypto_utils import (
     generate_or_load_keys,
     public_key_fingerprint,
     session_confirm_token,
+    build_session_offer_sig_bytes,
+    rsa_sign_pss_sha256,
+    rsa_verify_pss_sha256,
+    b64e,
+    b64d,
 )
 
 from protocol import (
@@ -43,6 +48,8 @@ session_keys = {}     # {"Alice": <aes_key_bytes>}
 session_confirmed = {}  # {"Alice": bool}  (initiator-side: confirmed via SESSION_ACK)
 pending_session_acks = {}  # {(peer_name, session_id): aes_key_bytes}
 last_rekey_time = {}  # {"Alice": timestamp}
+send_ctr = {}  # {"Alice": int}
+recv_ctr = {}  # {"Alice": int}
 REKEY_SUGGEST_INTERVAL = 300   # 5 phút -> gợi ý re-key
 
 def load_known_keys():
@@ -114,10 +121,22 @@ def receive_messages(proto: ProtoClient) -> None:
             elif t == TYPE_SESSION_OFFER:
                 sender_name = m["payload"]["from"]
                 session_id = m["payload"].get("session_id")
-                encrypted_key_b64 = m["payload"]["encrypted_key_b64"]
+                encrypted_key_b64 = m["payload"].get("encrypted_key_b64")
+                sig_b64 = m["payload"].get("sig_b64")
 
-                if not session_id:
-                    print(f"[LOI] SESSION_OFFER tu {sender_name} thieu session_id, bo qua.")
+                if not session_id or not encrypted_key_b64 or not sig_b64:
+                    print(f"[LOI] SESSION_OFFER tu {sender_name} thieu field, bo qua.")
+                    continue
+
+                # Must have sender public key in directory (TOFU already)
+                sender_pub = user_directory.get(sender_name)
+                if sender_pub is None:
+                    print(f"[LOI] Chua co public key cua {sender_name} -> bo qua SESSION_OFFER.")
+                    continue
+
+                signed = build_session_offer_sig_bytes(sender_name, my_name, session_id, encrypted_key_b64)
+                if not rsa_verify_pss_sha256(sender_pub, b64d(sig_b64), signed):
+                    print(f"[CANH BAO] SESSION_OFFER tu {sender_name} co signature KHONG HOP LE -> bo qua.")
                     continue
 
                 encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
@@ -126,8 +145,9 @@ def receive_messages(proto: ProtoClient) -> None:
                 session_keys[sender_name] = aes_key
                 session_confirmed[sender_name] = True
                 last_rekey_time[sender_name] = time.time()
+                send_ctr[sender_name] = 0
+                recv_ctr[sender_name] = 0
 
-                # Send ACK to confirm receiver decrypted the same key
                 confirm_hex = session_confirm_token(aes_key, session_id)
                 proto.send_session_ack(sender_name, session_id, confirm_hex)
 
@@ -157,8 +177,12 @@ def receive_messages(proto: ProtoClient) -> None:
                     )
                     continue
 
+                session_keys[sender_name] = key
                 session_confirmed[sender_name] = True
                 last_rekey_time[sender_name] = time.time()
+                send_ctr[sender_name] = 0
+                recv_ctr[sender_name] = 0
+
                 print(
                     f"[HE THONG] {sender_name} da ACK thanh cong. Kenh E2EE da duoc xac nhan (session_id={session_id})."
                 )
@@ -166,15 +190,35 @@ def receive_messages(proto: ProtoClient) -> None:
             elif t == TYPE_PRIVATE_MSG:
                 sender_name = m["payload"]["from"]
                 encrypted_content_b64 = m["payload"]["ciphertext_b64"]
+                ctr = m["payload"].get("ctr")
+
+                if ctr is None:
+                    print(f"[LOI] PRIVATE_MSG thieu ctr: {m}")
+                    continue
+
+                try:
+                    ctr = int(ctr)
+                except Exception:
+                    print(f"[LOI] ctr khong hop le: {ctr}")
+                    continue
+
+                last = recv_ctr.get(sender_name, 0)
+                if ctr <= last:
+                    print(f"[WARNING] Replay/Out-of-order tu {sender_name}: ctr={ctr} <= last={last} -> drop")
+                    continue
+
                 if sender_name in session_keys:
                     session_key = session_keys[sender_name]
                     encrypted_bytes = base64.b64decode(encrypted_content_b64)
-                    aad = f"{sender_name}|{my_name}".encode("utf-8")
+
+                    aad = f"{sender_name}|{my_name}|{ctr}".encode("utf-8")
                     decrypted_text = aes_decrypt(encrypted_bytes, session_key, associated_data=aad)
+
                     if decrypted_text:
+                        recv_ctr[sender_name] = ctr
                         print(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
                     else:
-                        print(f"[LOI] Khong the giai ma tin nhan tu {sender_name}.")
+                        print(f"[LOI] Khong the giai ma tin nhan tu {sender_name} (ctr={ctr}).")
                 else:
                     print(f"[INFO] Nhan tin nhan ma hoa tu {sender_name} nhung chua co khoa. Hay go /connect {sender_name}")
 
@@ -336,7 +380,10 @@ def start_client() -> None:
                 session_id = uuid.uuid4().hex
                 pending_session_acks[(target_name, session_id)] = aes_key
                 session_confirmed[target_name] = False
-                proto.send_session_offer(target_name, session_id, encrypted_key_b64)
+                sig_bytes = build_session_offer_sig_bytes(my_name, target_name, session_id, encrypted_key_b64)
+                sig_b64 = b64e(rsa_sign_pss_sha256(my_private_key, sig_bytes))
+                
+                proto.send_session_offer(target_name, session_id, encrypted_key_b64, sig_b64)
                 print(f"[HE THONG] Da gui loi moi E2EE den {target_name}.")
 
             elif message.startswith("/chat "):
@@ -361,16 +408,23 @@ def start_client() -> None:
                         print(f"[INFO] Phien voi {target_name} chua duoc ACK xac nhan. Tin nhan van co the gui, nhung nen doi ACK de dam bao doi phuong da nhan khoa.")
 
                     session_key = session_keys[target_name]
-                    aad = f"{my_name}|{target_name}".encode("utf-8")
-                    encrypted_bytes = aes_encrypt(plain_content.encode("utf-8"), session_key, associated_data=aad)
-                    
+                    # Anti-replay counter
+                    ctr = int(send_ctr.get(target_name, 0)) + 1
+                    aad = f"{my_name}|{target_name}|{ctr}".encode("utf-8")
+
+                    encrypted_bytes = aes_encrypt(
+                        plain_content.encode("utf-8"),
+                        session_key,
+                        associated_data=aad
+                    )
                     if encrypted_bytes is None:
                         print("[LOI] Ma hoa that bai, khong gui tin nhan.")
                         continue
-                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
 
-                    proto.send_private_msg(target_name, encrypted_b64)
+                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode("utf-8")
 
+                    proto.send_private_msg(target_name, encrypted_b64, ctr)
+                    send_ctr[target_name] = ctr
                     print(f"[DA GUI] toi {target_name}: {plain_content}")
 
                 except Exception as e:  # noqa: BLE001

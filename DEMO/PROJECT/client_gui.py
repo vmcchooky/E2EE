@@ -9,6 +9,7 @@ import os
 import json
 import uuid
 import ssl
+import time
 
 # Import các hàm mã hóa của bạn
 from crypto_utils import (
@@ -18,7 +19,12 @@ from crypto_utils import (
     load_public_key_from_bytes,
     public_key_fingerprint,
     generate_or_load_keys,
-    session_confirm_token
+    session_confirm_token,
+    build_session_offer_sig_bytes,
+    rsa_sign_pss_sha256,
+    rsa_verify_pss_sha256,
+    b64e,
+    b64d,
 )
 
 from protocol import (
@@ -27,6 +33,9 @@ from protocol import (
 )
 
 from transport import ProtoClient
+
+REKEY_INTERVAL_SEC = 20 * 60   # 20 phút
+REKEY_AFTER_MSGS = 50          # sau 50 tin nhắn outbound với 1 peer thì re-key
 
 # Cấu hình giao diện chung
 ctk.set_appearance_mode("Dark")  # Modes: "System" (standard), "Dark", "Light"
@@ -138,8 +147,13 @@ class ChatApp(ctk.CTk):
         self.session_keys = {}   # {name: aes_key}
         self.session_confirmed = {}  # {name: bool}
         self.pending_session_acks = {}  # {(name, session_id): aes_key}
+        # Anti-replay + auto rekey state
+        self.send_ctr = {}         # {peer: last_sent_ctr}
+        self.recv_ctr = {}         # {peer: last_recv_ctr}
+        self.out_msg_count = {}    # {peer: outbound_count_since_rekey}
+        self.last_rekey_time = {}  # {peer: unix_ts}
         self.my_private_key = None
-        
+
         # Biến chọn người đang chat
         self.current_chat_partner = "Broadcast" # Mặc định chat chung
         self.user_buttons = {} # [FIX] Thêm dictionary để quản lý nút bấm
@@ -511,6 +525,10 @@ class ChatApp(ctk.CTk):
                 self.user_directory.pop(name, None)
                 self.session_keys.pop(name, None)
                 self.session_confirmed.pop(name, None)
+                self.send_ctr.pop(name, None)
+                self.recv_ctr.pop(name, None)
+                self.out_msg_count.pop(name, None)
+                self.last_rekey_time.pop(name, None)
 
                 # Drop pending ACKs liên quan
                 for k in list(self.pending_session_acks.keys()):
@@ -577,26 +595,36 @@ class ChatApp(ctk.CTk):
                 sender_name = payload.get("from")
                 session_id = payload.get("session_id")
                 encrypted_key_b64 = payload.get("encrypted_key_b64")
+                sig_b64 = payload.get("sig_b64")
 
-                if not sender_name or not session_id or not encrypted_key_b64:
+                if not sender_name or not session_id or not encrypted_key_b64 or not sig_b64:
                     self.display_message(f"[ERROR] SESSION_OFFER không hợp lệ: {m}")
+                    return
+
+                sender_pub = self.user_directory.get(sender_name)
+                if sender_pub is None:
+                    self.display_message(f"[ERROR] Chưa có public key của {sender_name} -> bỏ qua SESSION_OFFER.")
+                    return
+
+                signed = build_session_offer_sig_bytes(sender_name, self.username, session_id, encrypted_key_b64)
+                if not rsa_verify_pss_sha256(sender_pub, b64d(sig_b64), signed):
+                    self.display_message(f"[WARNING] SESSION_OFFER từ {sender_name} có signature KHÔNG hợp lệ -> bỏ qua.")
                     return
 
                 encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
                 aes_key = rsa_decrypt(encrypted_key_bytes, self.my_private_key)
 
                 self.session_keys[sender_name] = aes_key
+                self.send_ctr[sender_name] = 0
+                self.recv_ctr[sender_name] = 0
+                self.out_msg_count[sender_name] = 0
+                self.last_rekey_time[sender_name] = time.time()
                 self.session_confirmed[sender_name] = True
 
-                # Send ACK back to initiator
                 confirm_hex = session_confirm_token(aes_key, session_id)
                 self.proto.send_session_ack(sender_name, session_id, confirm_hex)
 
-                self.display_message(
-                    f"[SECURE] Đã thiết lập / cập nhật khóa E2EE với {sender_name} (session_id={session_id})."
-                )
-                self.display_message(f"[SECURE] Đã gửi ACK xác nhận khóa cho {sender_name}.")
-                # Chỉ cập nhật header bên phải
+                self.display_message(f"[SYSTEM] Đã thiết lập E2EE với {sender_name} (session_id={session_id}) và gửi ACK.")
                 self.ui(self.update_chat_header)
 
             except Exception as e:
@@ -626,7 +654,16 @@ class ChatApp(ctk.CTk):
                     )
                     return
 
+                # Commit key mới + reset state (cực quan trọng cho re-key)
+                self.session_keys[sender_name] = key
                 self.session_confirmed[sender_name] = True
+
+                # Reset counters để anti-replay đồng bộ với key mới
+                self.send_ctr[sender_name] = 0
+                self.recv_ctr[sender_name] = 0
+                self.out_msg_count[sender_name] = 0
+                self.last_rekey_time[sender_name] = time.time()
+
                 self.display_message(
                     f"[SECURE] {sender_name} đã ACK thành công. Kênh E2EE được xác nhận (session_id={session_id})."
                 )
@@ -639,20 +676,33 @@ class ChatApp(ctk.CTk):
             try:
                 sender_name = payload.get("from")
                 ciphertext_b64 = payload.get("ciphertext_b64")
+                ctr = payload.get("ctr")
+
+                if not sender_name or not ciphertext_b64 or ctr is None:
+                    self.display_message(f"[ERROR] PRIVATE_MSG không hợp lệ: {m}")
+                    return
 
                 if sender_name not in self.session_keys:
-                    self.display_message(f"[INFO] Nhận tin nhắn mã hóa từ {sender_name} nhưng chưa có khóa. Hãy kết nối trước.")
+                    self.display_message(f"[INFO] Nhận tin mã hóa từ {sender_name} nhưng chưa có khóa.")
+                    return
+
+                ctr = int(ctr)
+                last = self.recv_ctr.get(sender_name, 0)
+                if ctr <= last:
+                    self.display_message(f"[WARNING] Replay/Out-of-order từ {sender_name}: ctr={ctr} <= last={last} -> drop")
                     return
 
                 session_key = self.session_keys[sender_name]
                 encrypted_bytes = base64.b64decode(ciphertext_b64)
-                aad = f"{sender_name}|{self.username}".encode("utf-8")
+
+                aad = f"{sender_name}|{self.username}|{ctr}".encode("utf-8")
                 decrypted_text = aes_decrypt(encrypted_bytes, session_key, associated_data=aad)
 
                 if decrypted_text:
+                    self.recv_ctr[sender_name] = ctr
                     self.display_message(f"[E2EE] <{sender_name}>: {decrypted_text.decode('utf-8')}")
                 else:
-                    self.display_message(f"[ERROR] Không thể giải mã tin nhắn từ {sender_name}.")
+                    self.display_message(f"[ERROR] Không thể giải mã tin nhắn từ {sender_name} (ctr={ctr}).")
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý PRIVATE_MSG: {e}")
 
@@ -680,23 +730,43 @@ class ChatApp(ctk.CTk):
             except Exception as e:  # noqa: BLE001
                 self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn broadcast: {e}")
         else:
-            # Gửi mã hóa (Logic Tuần 6)
+            # Nếu đang handshake/rekey (chưa ACK) thì block để tránh lệch key
+            if not self.session_confirmed.get(target, False):
+                self.display_message(f"[INFO] Đang (re)key với {target}, vui lòng đợi ACK rồi gửi lại.")
+                self.entry_message.delete(0, "end")
+                return
+
             if target in self.session_keys:
                 try:
                     session_key = self.session_keys[target]
-                    aad = f"{self.username}|{target}".encode("utf-8")
+
+                    # ctr tăng dần cho anti-replay
+                    ctr = self.send_ctr.get(target, 0) + 1
+                    self.send_ctr[target] = ctr
+
+                    aad = f"{self.username}|{target}|{ctr}".encode("utf-8")
                     encrypted_bytes = aes_encrypt(msg.encode("utf-8"), session_key, associated_data=aad)
                     if encrypted_bytes is None:
                         self.display_message("[ERROR] Mã hóa thất bại, không gửi tin nhắn.")
                         return
-                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
-                    self.proto.send_private_msg(target, encrypted_b64)
+
+                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode("utf-8")
+
+                    # Gửi kèm ctr
+                    self.proto.send_private_msg(target, encrypted_b64, ctr)
+
                     self.display_message(f"Me (to {target}) 🔒: {msg}")
-                except Exception as e:  # noqa: BLE001
+
+                    # track count cho auto rekey
+                    self.out_msg_count[target] = self.out_msg_count.get(target, 0) + 1
+
+                    # gọi auto rekey sau khi gửi (không phá message hiện tại)
+                    self.maybe_auto_rekey(target)
+
+                except Exception as e:
                     self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn: {e}")
             else:
                 self.display_message(f"[ERROR] Chưa có khóa với {target}. Đang yêu cầu kết nối...")
-                # Tự động gửi yêu cầu kết nối (/connect logic)
                 self.perform_handshake(target)
 
         self.entry_message.delete(0, "end")
@@ -763,8 +833,10 @@ class ChatApp(ctk.CTk):
             session_id = uuid.uuid4().hex
             self.pending_session_acks[(target_name, session_id)] = aes_key
             self.session_confirmed[target_name] = False
-            self.proto.send_session_offer(target_name, session_id, encrypted_key_b64)
+            sig_bytes = build_session_offer_sig_bytes(self.username, target_name, session_id, encrypted_key_b64)
+            sig_b64 = b64e(rsa_sign_pss_sha256(self.my_private_key, sig_bytes))
 
+            self.proto.send_session_offer(target_name, session_id, encrypted_key_b64, sig_b64)
             self.display_message(f"[SYSTEM] Đã gửi lời mời E2EE đến {target_name}.")
             # FIX: cập nhật header + enable Re-key nếu đang chat với user này
             self.ui(self.update_chat_header)
@@ -772,6 +844,53 @@ class ChatApp(ctk.CTk):
 
         except Exception as e:  # noqa: BLE001
             self.display_message(f"[ERROR] Lỗi khi bắt tay với {target_name}: {e}")
+
+    def maybe_auto_rekey(self, target: str) -> None:
+        """
+        Auto re-key theo timer / message-count.
+        Nhẹ: gửi SESSION_OFFER để đổi key cho các tin nhắn tiếp theo.
+        Không block gửi tin nhắn hiện tại (vẫn dùng key cũ).
+        """
+        if not target or target in ("Broadcast", self.username):
+            return
+        if target not in self.session_keys:
+            return
+        if not self.session_confirmed.get(target, False):
+            return
+        if target not in self.user_directory:
+            return
+        if not self.proto:
+            return
+
+        now = time.time()
+        last = self.last_rekey_time.get(target, 0)
+        out_n = self.out_msg_count.get(target, 0)
+
+        due_time = (last > 0) and ((now - last) >= REKEY_INTERVAL_SEC)
+        due_msgs = out_n >= REKEY_AFTER_MSGS
+
+        if not (due_time or due_msgs):
+            return
+
+        try:
+            target_pubkey_obj = self.user_directory[target]
+            aes_key = generate_aes_key()
+            encrypted_aes_key = rsa_encrypt(aes_key, target_pubkey_obj)
+
+            encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode("utf-8")
+            session_id = uuid.uuid4().hex
+
+            self.pending_session_acks[(target, session_id)] = aes_key
+            self.session_confirmed[target] = False
+
+            # Nếu bạn đã áp dụng patch SIGNATURE cho SESSION_OFFER:
+            sig_bytes = build_session_offer_sig_bytes(self.username, target, session_id, encrypted_key_b64)
+            sig_b64 = b64e(rsa_sign_pss_sha256(self.my_private_key, sig_bytes))
+            self.proto.send_session_offer(target, session_id, encrypted_key_b64, sig_b64)
+
+            self.display_message(f"[SYSTEM] Auto re-key triggered for {target} (time={due_time}, msgs={due_msgs}).")
+        except Exception as e:
+            self.display_message(f"[ERROR] Auto re-key failed for {target}: {e}")
 
     def rekey_current_session(self):
         """Đổi lại AES key cho phiên chat hiện tại (GUI-only)."""
@@ -803,7 +922,10 @@ class ChatApp(ctk.CTk):
             session_id = uuid.uuid4().hex
             self.pending_session_acks[(target, session_id)] = aes_key
             self.session_confirmed[target] = False
-            self.proto.send_session_offer(target, session_id, encrypted_key_b64)
+            sig_bytes = build_session_offer_sig_bytes(self.username, target, session_id, encrypted_key_b64)
+            sig_b64 = b64e(rsa_sign_pss_sha256(self.my_private_key, sig_bytes))
+            self.proto.send_session_offer(target, session_id, encrypted_key_b64, sig_b64)
+
             self.display_message(f"[SYSTEM] Đã Re-key E2EE với {target}.")
             # Sau khi re-key, chắc chắn đang có khóa
             self.ui(self.update_chat_header)

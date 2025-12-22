@@ -81,12 +81,17 @@ def m_pubkey(pubkey_b64: str) -> Dict[str, Any]:
 def m_broadcast(text: str) -> Dict[str, Any]:
     return {"type": TYPE_BROADCAST, "payload": {"text": text}}
 
-def m_session_offer(to: str, session_id: str, encrypted_key_b64: str) -> Dict[str, Any]:
+def m_session_offer(to: str, session_id: str, encrypted_key_b64: str, sig_b64: str) -> Dict[str, Any]:
     return {
         "type": TYPE_SESSION_OFFER,
         "to": to,
-        "payload": {"session_id": session_id, "encrypted_key_b64": encrypted_key_b64},
+        "payload": {
+            "session_id": session_id,
+            "encrypted_key_b64": encrypted_key_b64,
+            "sig_b64": sig_b64,
+        },
     }
+
 
 
 
@@ -97,7 +102,15 @@ def m_session_ack(to: str, session_id: str, confirm_hex: str) -> Dict[str, Any]:
         "payload": {"session_id": session_id, "confirm_hex": confirm_hex},
     }
 
-def m_private_msg(to: str, ciphertext_b64: str) -> Dict[str, Any]:
-    return {"type": TYPE_PRIVATE_MSG, "to": to, "payload": {"ciphertext_b64": ciphertext_b64}}
+def m_private_msg(to: str, ciphertext_b64: str, ctr: int) -> Dict[str, Any]:
+    return {
+        "type": TYPE_PRIVATE_MSG,
+        "to": to,
+        "payload": {
+            "ciphertext_b64": ciphertext_b64,
+            "ctr": int(ctr),
+        },
+    }
+
 # You can add more helper functions for other message types as needed
 # End of protocol.py

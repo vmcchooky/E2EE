@@ -1,6 +1,7 @@
 # crypto_utils.py
 import os
 from typing import Optional
+import base64
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
@@ -26,7 +27,6 @@ def rsa_encrypt(data: bytes, public_key_obj) -> bytes:
         ),
     )
 
-
 def rsa_decrypt(encrypted_data: bytes, private_key_obj) -> bytes:
     """Decrypt bytes with RSA-OAEP(SHA-256)."""
     return private_key_obj.decrypt(
@@ -38,6 +38,39 @@ def rsa_decrypt(encrypted_data: bytes, private_key_obj) -> bytes:
         ),
     )
 
+def build_session_offer_sig_bytes(sender: str, receiver: str, session_id: str, encrypted_key_b64: str) -> bytes:
+    """
+    Canonical bytes to sign for SESSION_OFFER authentication.
+    Keep this stable across versions.
+    """
+    # Use a strict delimiter + UTF-8, do NOT pretty-print JSON (avoid ambiguity)
+    msg = f"{sender}|{receiver}|{session_id}|{encrypted_key_b64}"
+    return msg.encode("utf-8")
+
+def rsa_sign_pss_sha256(private_key, data: bytes) -> bytes:
+    return private_key.sign(
+        data,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+        hashes.SHA256(),
+    )
+
+def rsa_verify_pss_sha256(public_key, signature: bytes, data: bytes) -> bool:
+    try:
+        public_key.verify(
+            signature,
+            data,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception:
+        return False
+
+def b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
+
+def b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("utf-8"))
 
 # ---------------- AES-GCM helpers ----------------
 
@@ -47,40 +80,21 @@ def generate_aes_key() -> bytes:
 
 
 def aes_encrypt(data_bytes: bytes, key: bytes, associated_data: Optional[bytes] = None) -> bytes:
-    """
-    AES-GCM encrypt.
-    Returns: nonce(12) + ciphertext||tag
-    """
-    if not isinstance(data_bytes, (bytes, bytearray)):
-        raise TypeError("data_bytes must be bytes")
-    if not isinstance(key, (bytes, bytearray)):
-        raise TypeError("key must be bytes")
-
-    aesgcm = AESGCM(bytes(key))
-    nonce = os.urandom(12)
-    ct = aesgcm.encrypt(nonce, bytes(data_bytes), associated_data=associated_data)
+    nonce = os.urandom(12)  # 96-bit nonce recommended for GCM
+    aesgcm = AESGCM(key)
+    ct = aesgcm.encrypt(nonce, data_bytes, associated_data)
     return nonce + ct
 
-
 def aes_decrypt(encrypted_data: bytes, key: bytes, associated_data: Optional[bytes] = None) -> Optional[bytes]:
-    """
-    AES-GCM decrypt.
-    Input: nonce(12) + ciphertext||tag
-    Returns plaintext bytes, or None if authentication fails.
-    """
+    if not encrypted_data or len(encrypted_data) < 13:
+        return None
+    nonce = encrypted_data[:12]
+    ct = encrypted_data[12:]
     try:
-        if not isinstance(encrypted_data, (bytes, bytearray)):
-            raise TypeError("encrypted_data must be bytes")
-        if not isinstance(key, (bytes, bytearray)):
-            raise TypeError("key must be bytes")
-
-        buf = bytes(encrypted_data)
-        nonce = buf[:12]
-        ct = buf[12:]
-        aesgcm = AESGCM(bytes(key))
-        return aesgcm.decrypt(nonce, ct, associated_data=associated_data)
+        aesgcm = AESGCM(key)
+        return aesgcm.decrypt(nonce, ct, associated_data)
     except Exception:
-        # InvalidTag or malformed input -> treat as tamper / wrong key
+        # treat as tampered / wrong key
         return None
 
 
