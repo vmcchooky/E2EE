@@ -33,7 +33,7 @@ from crypto_utils import (
 
 from protocol import (
     TYPE_NAME_REQ, TYPE_AUTH_REQ, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ,
-    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_BROADCAST
+    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_DIRECT_MSG, TYPE_BROADCAST
 )
 from transport import ProtoClient
 
@@ -51,6 +51,11 @@ last_rekey_time = {}  # {"Alice": timestamp}
 send_ctr = {}  # {"Alice": int}
 recv_ctr = {}  # {"Alice": int}
 REKEY_SUGGEST_INTERVAL = 300   # 5 phút -> gợi ý re-key
+
+def _err_text(m: dict) -> str:
+    payload = (m or {}).get("payload") or {}
+    # server có thể gửi message hoặc reason
+    return payload.get("message") or payload.get("reason") or str(payload) or "Unknown error"
 
 def load_known_keys():
     """Nạp danh sách fingerprint đã lưu (TOFU)."""
@@ -90,6 +95,8 @@ def receive_messages(proto: ProtoClient) -> None:
                     session_keys.pop(name, None)
                     session_confirmed.pop(name, None)
                     last_rekey_time.pop(name, None)
+                    send_ctr.pop(name, None)
+                    recv_ctr.pop(name, None)
                     # Drop any pending ACKs involving this peer
                     for k in list(pending_session_acks.keys()):
                         if k[0] == name:
@@ -145,6 +152,10 @@ def receive_messages(proto: ProtoClient) -> None:
                 session_keys[sender_name] = aes_key
                 session_confirmed[sender_name] = True
                 last_rekey_time[sender_name] = time.time()
+                
+                # Reset ctr để anti-replay đồng bộ cho key mới
+                send_ctr[sender_name] = 0
+                recv_ctr[sender_name] = 0
 
                 confirm_hex = session_confirm_token(aes_key, session_id)
                 proto.send_session_ack(sender_name, session_id, confirm_hex)
@@ -177,6 +188,11 @@ def receive_messages(proto: ProtoClient) -> None:
 
                 session_confirmed[sender_name] = True
                 last_rekey_time[sender_name] = time.time()
+                
+                # Reset ctr cho key đã được confirm
+                send_ctr[sender_name] = 0
+                recv_ctr[sender_name] = 0
+                
                 print(
                     f"[HE THONG] {sender_name} da ACK thanh cong. Kenh E2EE da duoc xac nhan (session_id={session_id})."
                 )
@@ -220,7 +236,7 @@ def receive_messages(proto: ProtoClient) -> None:
                 print(f"<{m['payload']['from']}> {m['payload']['text']}")
 
             elif t == TYPE_ERROR:
-                print(f"[ERROR] {m['payload']['message']}")
+                print(f"[ERROR] {_err_text(m)}")
 
             else:
                 print(f"[UNKNOWN] {m}")
@@ -267,7 +283,7 @@ def start_client() -> None:
         # AUTH
         m = proto.recv()
         if m["type"] == TYPE_ERROR:
-            print(f"[ERROR] {m['payload']['message']}")
+            print(f"[ERROR] {_err_text(m)}")
             sock.close()
             return
         if m["type"] != TYPE_AUTH_REQ:
@@ -280,7 +296,7 @@ def start_client() -> None:
 
         m = proto.recv()
         if m["type"] == TYPE_ERROR:
-            print(f"[AUTH] That bai: {m['payload']['message']}")
+            print(f"[AUTH] That bai: {_err_text(m)}")
             sock.close()
             return
         if m["type"] != TYPE_AUTH_OK:
@@ -320,7 +336,7 @@ def start_client() -> None:
         # PUBKEY
         m = proto.recv()
         if m["type"] == TYPE_ERROR:
-            print(f"[ERROR] {m['payload']['message']}")
+            print(f"[ERROR] {_err_text(m)}")
             sock.close()
             return
         if m["type"] != TYPE_PUBKEY_REQ:
@@ -368,6 +384,8 @@ def start_client() -> None:
                 aes_key = generate_aes_key()
                 encrypted_aes_key = rsa_encrypt(aes_key, target_pubkey_obj)
                 session_keys[target_name] = aes_key
+                send_ctr[target_name] = 0
+                recv_ctr[target_name] = 0
                 last_rekey_time[target_name] = time.time()
 
                 encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
@@ -402,18 +420,22 @@ def start_client() -> None:
                         print(f"[INFO] Phien voi {target_name} chua duoc ACK xac nhan. Tin nhan van co the gui, nhung nen doi ACK de dam bao doi phuong da nhan khoa.")
 
                     session_key = session_keys[target_name]
-                    aad = f"{my_name}|{target_name}".encode("utf-8")
-                    encrypted_bytes = aes_encrypt(plain_content.encode("utf-8"), session_key, associated_data=aad)
-                    
+                    ctr = int(send_ctr.get(target_name, 0)) + 1
+                    send_ctr[target_name] = ctr
+                    aad = f"{my_name}|{target_name}|{ctr}".encode("utf-8")
+                    encrypted_bytes = aes_encrypt(
+                        plain_content.encode("utf-8"),
+                        session_key,
+                        associated_data=aad
+                    )                    
                     if encrypted_bytes is None:
                         print("[LOI] Ma hoa that bai, khong gui tin nhan.")
                         continue
-                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode('utf-8')
-
-                    proto.send_private_msg(target_name, encrypted_b64)
-
+                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode("utf-8")
+                    proto.send_private_msg(target_name, encrypted_b64, ctr)
+                    
                     print(f"[DA GUI] toi {target_name}: {plain_content}")
-
+                    
                 except Exception as e:  # noqa: BLE001
                     print(f"Loi khi gui tin nhan: {e}")
             else:

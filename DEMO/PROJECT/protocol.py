@@ -64,6 +64,7 @@ TYPE_USER_ANNOUNCE = "USER_ANNOUNCE"      # server -> clients
 TYPE_SESSION_OFFER = "SESSION_OFFER"      # client -> server -> target
 TYPE_SESSION_ACK = "SESSION_ACK"          # target -> server -> initiator
 TYPE_PRIVATE_MSG = "PRIVATE_MSG"          # client -> server -> target
+TYPE_DIRECT_MSG = "DIRECT_MSG"          # client -> server -> target (plaintext)
 TYPE_BROADCAST = "BROADCAST"              # client -> server -> all
 
 # Optional: type for re-key acknowledgement if you want later
@@ -114,3 +115,11 @@ def m_private_msg(to: str, ciphertext_b64: str, ctr: int) -> Dict[str, Any]:
 
 # You can add more helper functions for other message types as needed
 # End of protocol.py
+
+
+def m_direct_msg(to: str, text: str) -> Dict[str, Any]:
+    return {
+        "type": TYPE_DIRECT_MSG,
+        "to": to,
+        "payload": {"text": text},
+    }

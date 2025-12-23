@@ -21,7 +21,7 @@ from protocol import (
     TYPE_PUBKEY_REQ, TYPE_PUBKEY,
     TYPE_USER_ANNOUNCE,
     TYPE_SESSION_OFFER, TYPE_SESSION_ACK,
-    TYPE_PRIVATE_MSG, TYPE_BROADCAST
+    TYPE_PRIVATE_MSG, TYPE_BROADCAST, TYPE_DIRECT_MSG,
 )
 from server_transport import ProtoPeer
 
@@ -32,10 +32,8 @@ from server_transport import ProtoPeer
 HOST = "127.0.0.1"
 PORT = 12345
 
-# Làm đường dẫn cert/key theo vị trí file để tránh phụ thuộc "working directory"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TLS_CERTFILE = os.path.normpath(os.path.join(BASE_DIR, "..", "certs", "server_cert.pem"))
-TLS_KEYFILE = os.path.normpath(os.path.join(BASE_DIR, "..", "certs", "server_key.pem"))
+TLS_CERTFILE = "../certs/server_cert.pem"
+TLS_KEYFILE = "../certs/server_key.pem"
 
 AUTH_FILE = "Users/auth_users.json"
 
@@ -328,6 +326,14 @@ def handle_client(sock: socket.socket):
                 else:
                     peer.send_error("User offline")
 
+            elif t == TYPE_DIRECT_MSG:
+                target = m.get("to") or m["payload"].get("to")
+                cs = find_socket_by_name(target)
+                if cs:
+                    ProtoPeer(cs).forward_direct(name, m["payload"].get("text", ""))
+                else:
+                    peer.send_error("User offline")
+
             elif t == TYPE_SESSION_OFFER:
                 cs = find_socket_by_name(m.get("to"))
                 if cs:
@@ -374,15 +380,12 @@ def command_input():
         if cmd in ("exit", "quit"):
             print("[SERVER] Shutdown requested by console.")
             server_running = False
-            if server_socket:
-                server_socket.close()
             break
 
 
 def start_server():
-    # IMPORTANT: phải khai báo server_running là global vì ta có gán lại ở finally.
-    # Nếu không, Python sẽ coi server_running là biến local và crash UnboundLocalError.
-    global server_socket, server_running
+    global server_socket
+    global server_running
 
     load_user_db()
 
@@ -406,7 +409,6 @@ def start_server():
             except socket.timeout:
                 continue
             except OSError:
-                # server_socket có thể bị close từ thread command_input
                 break
 
             sock = ctx.wrap_socket(raw, server_side=True)
@@ -421,12 +423,7 @@ def start_server():
 
     finally:
         server_running = False
-        try:
-            if server_socket:
-                server_socket.close()
-        except Exception:
-            pass
-        server_socket = None
+        server_socket.close()
         print("[SERVER] Server stopped.")
 
 # ============================================================

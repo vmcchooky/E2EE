@@ -4,14 +4,16 @@ import customtkinter as ctk
 import base64
 from datetime import datetime
 from tkinter import messagebox
+from protocol import ProtoError
+
+import queue
 
 import os
 import json
 import uuid
 import ssl
 import time
-
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
 
 # Import các hàm mã hóa của bạn
 from crypto_utils import (
@@ -31,7 +33,7 @@ from crypto_utils import (
 
 from protocol import (
     TYPE_NAME_REQ, TYPE_AUTH_REQ, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ,
-    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_BROADCAST
+    TYPE_USER_ANNOUNCE, TYPE_SESSION_OFFER, TYPE_SESSION_ACK, TYPE_PRIVATE_MSG, TYPE_DIRECT_MSG, TYPE_BROADCAST
 )
 
 from transport import ProtoClient
@@ -42,6 +44,10 @@ REKEY_AFTER_MSGS = 50          # sau 50 tin nhắn outbound với 1 peer thì re
 # Cấu hình giao diện chung
 ctk.set_appearance_mode("Dark")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
+
+def _err_text(m: dict) -> str:
+    payload = (m or {}).get("payload") or {}
+    return payload.get("message") or payload.get("reason") or str(payload) or "Unknown error"
 
 class ChatApp(ctk.CTk):
 
@@ -64,12 +70,18 @@ class ChatApp(ctk.CTk):
         self.user_directory = {}            # {name: public_key_bytes}
         self.session_keys = {}              # {name: aes_key}
         self.session_confirmed = {}         # {name: bool}
+        self.pending_session_acks = {}     # {(name, session_id): aes_key}
         self.session_ids = {}               # {name: session_id}
         self.pending_session_keys = {}      # {name: aes_key}
         self.pending_session_ids = {}       # {name: session_id}
         self.session_offers = {}            # {name: {session_id, aes_key, timestamp}}
         self.known_keys = {}                # {name: fingerprint_str}
-        self.peer_trust = {}                # {name: "TOFU"|"VERIFIED"|"CHANGED"}
+        self.peer_trust = {}
+        self.pending_key_changes = {}  # peer -> {old_fp,new_fp,pubkey_bytes}
+        self.pending_notices = {}      # peer -> [system message dict]
+        self.notice_flags = set()      # peers with pending notices
+        self.e2ee_enabled = {}         # peer -> bool (default False)
+                # {name: "TOFU"|"VERIFIED"|"CHANGED"}
 
         self.send_ctr = {}                  # {name: int}
         self.recv_ctr = {}                  # {name: int}
@@ -77,6 +89,11 @@ class ChatApp(ctk.CTk):
         self.last_rekey_time = {}           # {name: float}
 
         self.current_chat_partner = "Broadcast"
+        # ===== Thread-safe event queue (network thread -> UI thread) =====
+        self._event_q: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self._event_pump_ms = 60  # UI polling interval
+        self.after(self._event_pump_ms, self._pump_events)
+        # ===== UI state =====
 
         # UI conversation state
         self.chat_history = {"Broadcast": []}   # {conv_id: [message_dict]}
@@ -84,26 +101,20 @@ class ChatApp(ctk.CTk):
         self.conversation_widgets = {}          # {conv_id: {"root": frame, ...}}
         self.user_buttons = {}                  # kept for compatibility; maps to root frames
 
-        # Files / persistence
-        # NOTE: cần set trước khi gọi load_known_keys()
-        self.known_keys_file = "FingerPrint/known_keys_gui.json"
-
-        # Pending session ACKs (initiator side) - map (peer, session_id) -> aes_key
-        # (Trong code có dùng self.pending_session_acks; nếu không init sẽ crash khi chạy)
-        self.pending_session_acks = {}
-
         # Known key cache
+        self.known_keys_file = "FingerPrint/known_keys_gui.json"
         self.load_known_keys()
 
         # ===== Layout grid =====
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=0)  # sidebar
-        self.grid_columnconfigure(1, weight=1)  # main
+        self.grid_columnconfigure(1, weight=1)  # main center
+        self.grid_columnconfigure(2, weight=0)  # right info panel
 
         # ===== Sidebar =====
         self.sidebar = ctk.CTkFrame(self, width=320, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(2, weight=1)  # conversation list expands
+        self.sidebar.grid_rowconfigure(3, weight=1)  # conversation list expands
         self.sidebar.grid_columnconfigure(0, weight=1)
 
         # Top user strip
@@ -133,6 +144,17 @@ class ChatApp(ctk.CTk):
         )
         self.connect_btn.grid(row=0, column=1, rowspan=2, padx=(10, 0), sticky="e")
 
+
+        # Navigation (UI skeleton - chức năng sẽ bổ sung dần)
+        self.nav_var = ctk.StringVar(value="Chats")
+        self.nav = ctk.CTkSegmentedButton(
+            self.sidebar,
+            values=["Chats", "Contacts", "Groups", "Settings"],
+            variable=self.nav_var,
+            command=lambda _val: self._switch_nav_view()
+        )
+        self.nav.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
+
         # Search
         self.search_var = ctk.StringVar(value="")
         self.search_entry = ctk.CTkEntry(
@@ -140,7 +162,7 @@ class ChatApp(ctk.CTk):
             textvariable=self.search_var,
             placeholder_text="Tìm kiếm cuộc trò chuyện..."
         )
-        self.search_entry.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
+        self.search_entry.grid(row=2, column=0, padx=14, pady=(0, 10), sticky="ew")
         self.search_var.trace_add("write", lambda *_: self._apply_search_filter())
 
         # Conversation list
@@ -148,14 +170,26 @@ class ChatApp(ctk.CTk):
             self.sidebar,
             label_text="Chats"
         )
-        self.scrollable_user_list.grid(row=2, column=0, padx=14, pady=(0, 10), sticky="nsew")
+        self.scrollable_user_list.grid(row=3, column=0, padx=14, pady=(0, 10), sticky="nsew")
+
+        # Placeholder view for non-chat sections (Contacts/Groups/Settings)
+        self.nav_placeholder = ctk.CTkFrame(self.sidebar)
+        self.nav_placeholder_label = ctk.CTkLabel(
+            self.nav_placeholder,
+            text="(Giao diện đã sẵn sàng — chức năng sẽ bổ sung dần)",
+            font=ctk.CTkFont(size=12)
+        )
+        self.nav_placeholder_label.pack(padx=14, pady=14)
+
+        self.nav_placeholder.grid(row=2, column=0, rowspan=2, padx=14, pady=(0, 10), sticky="nsew")
+        self.nav_placeholder.grid_remove()  # chỉ hiện khi không ở Chats
 
         # Broadcast is always present
         self._ensure_conversation_tile("Broadcast", subtitle="Phòng chat chung", trust="")
 
         # Bottom actions
         self.sb_bottom = ctk.CTkFrame(self.sidebar)
-        self.sb_bottom.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="ew")
+        self.sb_bottom.grid(row=4, column=0, padx=14, pady=(0, 14), sticky="ew")
         self.sb_bottom.grid_columnconfigure((0, 1), weight=1)
 
         self.btn_my_fp = ctk.CTkButton(
@@ -173,6 +207,123 @@ class ChatApp(ctk.CTk):
         self.main.grid(row=0, column=1, sticky="nsew")
         self.main.grid_rowconfigure(1, weight=1)
         self.main.grid_columnconfigure(0, weight=1)
+
+        # ===== Right info panel (Messenger/Zalo style) =====
+        self.right_panel_visible = True
+        self.right_panel = ctk.CTkFrame(self, width=360, corner_radius=0)
+        self.right_panel.grid(row=0, column=2, sticky="nsew")
+        self.right_panel.grid_rowconfigure(1, weight=1)
+        self.right_panel.grid_columnconfigure(0, weight=1)
+
+        self.rp_title = ctk.CTkLabel(
+            self.right_panel,
+            text="Conversation",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self.rp_title.grid(row=0, column=0, padx=14, pady=(14, 10), sticky="w")
+
+        self.rp_tabs = ctk.CTkTabview(self.right_panel)
+        self.rp_tabs.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="nsew")
+
+        self.tab_info = self.rp_tabs.add("Info")
+        self.tab_security = self.rp_tabs.add("Security")
+        self.tab_activity = self.rp_tabs.add("Activity")
+
+        # ---- Info tab ----
+        self.tab_info.grid_columnconfigure(0, weight=1)
+
+        self.info_peer_name = ctk.CTkLabel(self.tab_info, text="Peer: (none)", font=ctk.CTkFont(size=14, weight="bold"))
+        self.info_peer_name.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+
+        self.info_peer_meta = ctk.CTkLabel(self.tab_info, text="Status: -", font=ctk.CTkFont(size=12))
+        self.info_peer_meta.grid(row=1, column=0, sticky="w", padx=10)
+
+        self.info_session = ctk.CTkLabel(self.tab_info, text="E2EE: -", font=ctk.CTkFont(size=12))
+        self.info_session.grid(row=2, column=0, sticky="w", padx=10, pady=(4, 0))
+
+        self.info_fingerprint = ctk.CTkLabel(self.tab_info, text="Fingerprint: -", font=ctk.CTkFont(size=12))
+        self.info_fingerprint.grid(row=3, column=0, sticky="w", padx=10, pady=(4, 10))
+
+        self.info_actions = ctk.CTkFrame(self.tab_info)
+        self.info_actions.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.info_actions.grid_columnconfigure((0, 1), weight=1)
+
+        self.btn_verify = ctk.CTkButton(self.info_actions, text="Mark Verified", command=self.mark_current_peer_verified)
+        self.btn_verify.grid(row=0, column=0, padx=(0, 6), pady=8, sticky="ew")
+
+        self.btn_clear_chat = ctk.CTkButton(self.info_actions, text="Clear Chat", command=self.clear_current_chat_ui)
+        self.btn_clear_chat.grid(row=0, column=1, padx=(6, 0), pady=8, sticky="ew")
+
+        self.btn_accept_key = ctk.CTkButton(self.info_actions, text="Accept New Key", command=self.accept_pending_key_for_current_peer)
+        self.btn_accept_key.grid(row=1, column=0, columnspan=2, padx=0, pady=(0, 8), sticky="ew")
+        self.btn_accept_key.configure(state="disabled")
+
+        self.info_more = ctk.CTkFrame(self.tab_info)
+        self.info_more.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.info_more.grid_columnconfigure((0, 1), weight=1)
+
+        self.btn_rekey_side = ctk.CTkButton(self.info_more, text="Re-key", command=self.rekey_current_session)
+        self.btn_rekey_side.grid(row=0, column=0, padx=(0, 6), pady=8, sticky="ew")
+
+        self.btn_export = ctk.CTkButton(self.info_more, text="Export (Soon)", command=lambda: self.log_status("Export: chưa triển khai", level="INFO"))
+        self.btn_export.grid(row=0, column=1, padx=(6, 0), pady=8, sticky="ew")
+
+        self.switch_e2ee = ctk.CTkSwitch(self.info_more, text="E2EE (this chat)", command=self.on_toggle_e2ee)
+        self.switch_e2ee.grid(row=1, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
+        self.switch_e2ee.deselect()
+
+        # ---- Security tab (self-check dashboard) ----
+        self.tab_security.grid_columnconfigure(0, weight=1)
+
+        self.sec_summary = ctk.CTkLabel(self.tab_security, text="Self-check: chưa chạy", font=ctk.CTkFont(size=12))
+        self.sec_summary.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+
+        self.sec_checks_frame = ctk.CTkFrame(self.tab_security, fg_color="transparent")
+        self.sec_checks_frame.grid(row=1, column=0, sticky="nsew", padx=10)
+        self.sec_checks_frame.grid_columnconfigure(0, weight=1)
+
+        self.sec_rows = {}  # key -> (label_name, label_value)
+        for i, key in enumerate(["TLS", "Identity", "E2EE", "Anti-replay", "Key store", "Re-key policy"]):
+            name_lbl = ctk.CTkLabel(self.sec_checks_frame, text=key, font=ctk.CTkFont(size=12, weight="bold"))
+            val_lbl = ctk.CTkLabel(self.sec_checks_frame, text="-", font=ctk.CTkFont(size=12))
+            name_lbl.grid(row=i, column=0, sticky="w", pady=4)
+            val_lbl.grid(row=i, column=1, sticky="e", pady=4)
+            self.sec_rows[key] = (name_lbl, val_lbl)
+
+        self.sec_btn_frame = ctk.CTkFrame(self.tab_security, fg_color="transparent")
+        self.sec_btn_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(10, 10))
+        self.sec_btn_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.btn_run_check = ctk.CTkButton(self.sec_btn_frame, text="Run Self-check", command=self.run_self_check)
+        self.btn_run_check.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        self.btn_dev_mode = ctk.CTkButton(self.sec_btn_frame, text="Open Activity", command=lambda: self.rp_tabs.set("Activity"))
+        self.btn_dev_mode.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+        # ---- Activity tab (status/notifications area) ----
+        self.tab_activity.grid_rowconfigure(1, weight=1)
+        self.tab_activity.grid_columnconfigure(0, weight=1)
+
+        self.act_hint = ctk.CTkLabel(
+            self.tab_activity,
+            text="Trạng thái / Thông báo hệ thống (giảm rối trong khung chat)",
+            font=ctk.CTkFont(size=12)
+        )
+        self.act_hint.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+
+        self.status_text = ctk.CTkTextbox(self.tab_activity, height=260)
+        self.status_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.status_text.configure(state="disabled")
+
+        self.act_btns = ctk.CTkFrame(self.tab_activity, fg_color="transparent")
+        self.act_btns.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.act_btns.grid_columnconfigure((0, 1), weight=1)
+
+        self.btn_clear_log = ctk.CTkButton(self.act_btns, text="Clear Log", command=self.clear_status_log)
+        self.btn_clear_log.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        self.btn_toggle_info = ctk.CTkButton(self.act_btns, text="Hide Panel", command=self.toggle_right_panel)
+        self.btn_toggle_info.grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
         # Header
         self.chat_header_frame = ctk.CTkFrame(self.main)
@@ -207,6 +358,19 @@ class ChatApp(ctk.CTk):
         self.rekey_button.grid(row=0, column=1, rowspan=2, padx=(10, 0), sticky="e")
         self.rekey_button.configure(state="disabled")
 
+        # Header actions (UI skeleton)
+        self.header_actions = ctk.CTkFrame(self.chat_header_frame, fg_color="transparent")
+        self.header_actions.grid(row=0, column=2, rowspan=2, padx=(10, 0), sticky="e")
+
+        self.btn_call = ctk.CTkButton(self.header_actions, text="Call", width=70, command=lambda: self.log_status("Call: chưa triển khai", level="INFO"))
+        self.btn_call.grid(row=0, column=0, padx=(0, 6))
+
+        self.btn_video = ctk.CTkButton(self.header_actions, text="Video", width=70, command=lambda: self.log_status("Video: chưa triển khai", level="INFO"))
+        self.btn_video.grid(row=0, column=1, padx=(0, 6))
+
+        self.btn_info = ctk.CTkButton(self.header_actions, text="Info", width=70, command=self.toggle_right_panel)
+        self.btn_info.grid(row=0, column=2)
+
         # Messages
         self.message_area = ctk.CTkScrollableFrame(self.main, label_text="")
         self.message_area.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="nsew")
@@ -231,6 +395,7 @@ class ChatApp(ctk.CTk):
 
         # First header render
         self.update_chat_header()
+        self.update_right_panel()
 
     def remove_user_button(self, name: str) -> None:
         """Xóa nút user khỏi sidebar (PHẢI gọi qua self.ui)."""
@@ -247,12 +412,423 @@ class ChatApp(ctk.CTk):
             self.after(0, lambda: fn(*args, **kwargs))
         except Exception:
             pass
+    
+    def post_event(self, kind: str, payload: object = None) -> None:
+        """Thread-safe: may be called from any thread."""
+        try:
+            self._event_q.put((kind, payload))
+        except Exception:
+            pass
+
+    def _pump_events(self) -> None:
+        """Runs on UI thread; drains queued events and dispatches handlers."""
+        try:
+            processed = 0
+            max_per_tick = 200  # prevent UI starvation
+            while processed < max_per_tick:
+                try:
+                    kind, payload = self._event_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                try:
+                    if kind == "NET_MSG":
+                        # All UI updates now happen on the UI thread.
+                        self.process_incoming_message(payload)  # payload is dict
+                    elif kind == "NET_ERR":
+                        self.log_status(f"Receive loop stopped: {payload}", level="ERROR")
+                    elif kind == "CONN_UI":
+                        state, detail = payload  # ("CONNECTED"/"DISCONNECTED", str)
+                        self._set_connection_ui(state, detail)
+                    elif kind == "STATUS":
+                        # payload = {"text": str, "level": "..."}
+                        if isinstance(payload, dict):
+                            self.log_status(str(payload.get("text", "")),
+                                            level=str(payload.get("level", "INFO")))
+                        else:
+                            self.log_status(str(payload), level="INFO")
+                    else:
+                        self.log_status(f"Unknown event: {kind}", level="WARN")
+                except Exception as e:
+                    # Never crash the pump
+                    try:
+                        self.log_status(f"Event handler error ({kind}): {e}", level="ERROR")
+                    except Exception:
+                        pass
+
+                processed += 1
+        finally:
+            # Reschedule if window still exists
+            try:
+                if self.winfo_exists():
+                    self.after(self._event_pump_ms, self._pump_events)
+            except Exception:
+                pass
+
+    def _switch_nav_view(self):
+        """UI only: chuyển giữa Chats/Contacts/Groups/Settings (chức năng sẽ bổ sung dần)."""
+        mode = (self.nav_var.get() if hasattr(self, "nav_var") else "Chats") or "Chats"
+        if mode == "Chats":
+            try:
+                self.nav_placeholder.grid_remove()
+            except Exception:
+                pass
+            try:
+                self.search_entry.grid()
+                self.scrollable_user_list.grid()
+            except Exception:
+                pass
+        else:
+            # Hide chat widgets to reduce visual noise
+            try:
+                self.search_entry.grid_remove()
+                self.scrollable_user_list.grid_remove()
+            except Exception:
+                pass
+            try:
+                self.nav_placeholder_label.configure(
+                    text=f"{mode}: giao diện đã sẵn sàng — chức năng sẽ bổ sung dần"
+                )
+                self.nav_placeholder.grid()
+            except Exception:
+                pass
+
+    def toggle_right_panel(self):
+        """Ẩn/hiện cột phải (Conversation/Info/Security/Activity)."""
+        try:
+            if self.right_panel_visible:
+                self.right_panel.grid_remove()
+                self.right_panel_visible = False
+                try:
+                    self.btn_toggle_info.configure(text="Show Panel")
+                except Exception:
+                    pass
+                try:
+                    self.btn_info.configure(text="Info")
+                except Exception:
+                    pass
+            else:
+                self.right_panel.grid()
+                self.right_panel_visible = True
+                try:
+                    self.btn_toggle_info.configure(text="Hide Panel")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def clear_status_log(self):
+        try:
+            self.status_text.configure(state="normal")
+            self.status_text.delete("1.0", "end")
+            self.status_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def log_status(self, text: str, level: str = "INFO"):
+        """Ghi thông báo trạng thái vào Activity tab (thread-safe)."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {level}: {text}\n"
+        self.ui(self._append_status_line, line)
+
+    def _append_status_line(self, line: str):
+        try:
+            self.status_text.configure(state="normal")
+            self.status_text.insert("end", line)
+            self.status_text.see("end")
+            self.status_text.configure(state="disabled")
+        except Exception:
+            # Nếu UI chưa dựng xong, fallback: ignore
+            pass
+
+    def clear_current_chat_ui(self):
+        """Chỉ clear UI history phía client (không ảnh hưởng server)."""
+        cid = self.current_chat_partner or "Broadcast"
+        self.chat_history[cid] = []
+        self.unread[cid] = 0
+        self._refresh_conversation_tile(cid)
+        if cid == self.current_chat_partner:
+            self._render_conversation(cid)
+        self.log_status(f"Cleared local chat history: {cid}", level="OK")
+        self.update_right_panel()
+
+    def on_toggle_e2ee(self):
+        peer = self.current_chat_partner
+        if not peer or peer == "Broadcast":
+            return
+        enabled = bool(self.switch_e2ee.get())
+        self.e2ee_enabled[peer] = enabled
+        if not enabled:
+            self._queue_security_notice(peer, "[SYSTEM] Bạn đang chat plaintext (E2EE OFF).")
+            self.update_chat_header()
+            self.update_right_panel()
+            return
+
+        # Enabling E2EE
+        if peer in self.pending_key_changes:
+            self._queue_security_notice(
+                peer,
+                "[SECURITY] Identity của peer đã thay đổi. Hãy Accept New Key sau khi xác minh fingerprint, rồi bật E2EE."
+            )
+            self.e2ee_enabled[peer] = False
+            try:
+                self.switch_e2ee.deselect()
+            except Exception:
+                pass
+            self.update_chat_header()
+            self.update_right_panel()
+            return
+
+        self._queue_security_notice(peer, "[SYSTEM] Đang bật E2EE cho cuộc trò chuyện này…")
+        if peer not in self.session_keys or not self.session_confirmed.get(peer, False):
+            self.perform_handshake(peer)
+        self.update_chat_header()
+        self.update_right_panel()
+
+    def mark_current_peer_verified(self):
+        """Đánh dấu peer hiện tại là VERIFIED (local trust)."""
+        peer = self.current_chat_partner
+        if not peer or peer == "Broadcast":
+            self.log_status("Không thể verify Broadcast.", level="WARN")
+            return
+        # Chỉ cho verify khi đã có fingerprint
+        fp = self.known_keys.get(peer)
+        if not fp:
+            self.log_status(f"Chưa có fingerprint cho {peer}.", level="WARN")
+            return
+        self.peer_trust[peer] = "VERIFIED"
+        self._refresh_conversation_tile(peer)
+        self.update_chat_header()
+        self.update_right_panel()
+        self.log_status(f"Marked {peer} as VERIFIED (local).", level="OK")
+
+    def _mask_fp(self, fp: str) -> str:
+        if not fp:
+            return "-"
+        raw = fp.replace(" ", "").strip()
+        if len(raw) <= 12:
+            return self.format_fingerprint(raw)
+        return self.format_fingerprint(raw[:8] + "…" + raw[-8:])
 
 
+    def update_right_panel(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.ui(self.update_right_panel)
+            return
+        """Cập nhật Info/Security panel theo cuộc hội thoại hiện tại."""
+        peer = self.current_chat_partner or "Broadcast"
+        try:
+            self.rp_title.configure(text="Conversation" if peer == "Broadcast" else f"Conversation: {peer}")
+        except Exception:
+            pass
+
+        if peer == "Broadcast":
+            try:
+                self.info_peer_name.configure(text="Peer: Broadcast")
+                self.info_peer_meta.configure(text="Status: room")
+                self.info_session.configure(text="E2EE: OFF")
+                self.info_fingerprint.configure(text="Fingerprint: -")
+                self.btn_verify.configure(state="disabled")
+                self.btn_rekey_side.configure(state="disabled")
+                self.btn_accept_key.configure(state="disabled")
+                try:
+                    self.switch_e2ee.deselect()
+                    self.switch_e2ee.configure(state="disabled")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self.run_self_check(silent=True)
+            return
+
+        trust = self.peer_trust.get(peer, "TOFU")
+        fp = self.known_keys.get(peer)
+        enabled = bool(self.e2ee_enabled.get(peer, False))
+
+        if not enabled:
+            e2ee = "OFF (Plaintext)"
+        else:
+            if peer in self.session_keys:
+                e2ee = "ON" if self.session_confirmed.get(peer, False) else "NEGOTIATING"
+            else:
+                e2ee = "SETUP"
+
+        try:
+            self.info_peer_name.configure(text=f"Peer: {peer}")
+            self.info_peer_meta.configure(text=f"Identity: {trust}")
+            self.info_session.configure(text=f"E2EE: {e2ee}")
+            self.info_fingerprint.configure(text=f"Fingerprint: {self._mask_fp(fp)}")
+            self.btn_verify.configure(state="normal" if fp else "disabled")
+
+            # Re-key only relevant when E2EE enabled and key exists
+            self.btn_rekey_side.configure(state="normal" if (enabled and peer in self.session_keys) else "disabled")
+
+            # Switch state
+            try:
+                if enabled:
+                    self.switch_e2ee.select()
+                else:
+                    self.switch_e2ee.deselect()
+                self.switch_e2ee.configure(state="normal")
+            except Exception:
+                pass
+
+            # Accept key button appears only when pending change exists
+            self.btn_accept_key.configure(state="normal" if peer in self.pending_key_changes else "disabled")
+
+        except Exception:
+            pass
+
+        self.run_self_check(silent=True)
+
+    def _set_sec_row(self, key: str, value: str):
+        row = self.sec_rows.get(key)
+        if not row:
+            return
+        try:
+            row[1].configure(text=value)
+        except Exception:
+            pass
+
+    def _queue_security_notice(self, peer: str, text: str) -> None:
+        """Queue a security/system notice for a specific peer.
+
+        Requirement:
+        - Do NOT show popups.
+        - Only show the notice inside that peer's chat thread.
+        - If the user is currently viewing that peer, show immediately.
+        - Otherwise, defer until the user opens that conversation.
+        """
+        if not peer or peer == "Broadcast":
+            return
+
+        msg = {"kind": "system", "direction": "in", "text": text, "meta": ""}
+
+        # If the conversation is currently open, render immediately.
+        if self.current_chat_partner == peer:
+            self._append_message(peer, msg, bump_unread_if_inactive=False)
+            self._render_conversation(peer)
+            self._refresh_conversation_tile(peer)
+            return
+
+        # Otherwise, defer until the user opens that chat.
+        self.pending_notices.setdefault(peer, []).append(msg)
+        self.notice_flags.add(peer)
+        self._refresh_conversation_tile(peer)
+
+    def _flush_security_notices_if_any(self, peer: str) -> None:
+        notes = self.pending_notices.get(peer) or []
+        if not notes:
+            return
+        # append to chat history only when user opens that conversation
+        for n in notes:
+            self._append_message(peer, n, bump_unread_if_inactive=False)
+        self.pending_notices[peer] = []
+        if peer in self.notice_flags:
+            self.notice_flags.remove(peer)
+        self._refresh_conversation_tile(peer)
+        if self.current_chat_partner == peer:
+            self._render_conversation(peer)
+
+    def accept_pending_key_for_current_peer(self):
+        peer = self.current_chat_partner
+        if not peer or peer == "Broadcast":
+            self.log_status("No peer selected.", level="WARN")
+            return
+        pend = self.pending_key_changes.get(peer)
+        if not pend:
+            self.log_status("No pending key change for this peer.", level="INFO")
+            return
+        try:
+            pubkey_bytes = pend["pubkey_bytes"]
+            new_fp = pend["new_fp"]
+            self.known_keys[peer] = new_fp
+            self.save_known_keys()
+            self.user_directory[peer] = load_public_key_from_bytes(pubkey_bytes)
+            # after accepting, treat as TOFU until user verifies out-of-band
+            self.peer_trust[peer] = "TOFU"
+            self.session_keys.pop(peer, None)
+            self.session_confirmed.pop(peer, None)
+            self.send_ctr.pop(peer, None)
+            self.recv_ctr.pop(peer, None)
+            self.out_msg_count.pop(peer, None)
+            self.last_rekey_time.pop(peer, None)
+            self.pending_key_changes.pop(peer, None)
+            self._queue_security_notice(peer, f"[SECURITY] Bạn đã chấp nhận public key mới của {peer}.\n" "Phiên E2EE cũ đã bị hủy.\n" "Hãy xác minh fingerprint ngoài kênh để đánh dấu Verified.")
+            self.update_right_panel()
+            self.update_chat_header()
+            self.log_status(f"Accepted new key for {peer}.", level="OK")
+        except Exception as e:
+            self.log_status(f"Accept key failed: {e}", level="ERROR")
+
+    def run_self_check(self, silent: bool = False):
+        """Self-check nhanh: chỉ hiển thị trạng thái, không lộ key thô."""
+        peer = self.current_chat_partner or "Broadcast"
+        issues = []
+
+        tls_on = bool(self.client_socket)
+        self._set_sec_row("TLS", "ON" if tls_on else "OFF")
+        if not tls_on:
+            issues.append("TLS is OFF")
+
+        if peer == "Broadcast":
+            self._set_sec_row("Identity", "N/A")
+            self._set_sec_row("E2EE", "OFF")
+            self._set_sec_row("Anti-replay", "N/A")
+            self._set_sec_row("Key store", "OK" if isinstance(self.known_keys, dict) else "ERROR")
+            self._set_sec_row("Re-key policy", f"{REKEY_INTERVAL_SEC//60}m / {REKEY_AFTER_MSGS} msgs")
+        else:
+            trust = self.peer_trust.get(peer, "TOFU")
+            self._set_sec_row("Identity", trust)
+            if trust == "CHANGED":
+                issues.append(f"Identity changed for {peer}")
+
+            enabled = self.e2ee_enabled.get(peer, False)
+            e2ee_state = "OFF (Plaintext)" if not enabled else "OFF"
+            if enabled and peer in self.session_keys:
+                e2ee_state = "ON" if self.session_confirmed.get(peer, False) else "NEGOTIATING"
+            self._set_sec_row("E2EE", e2ee_state)
+            if e2ee_state != "ON":
+                issues.append(f"E2EE not confirmed with {peer}")
+
+            # Anti-replay / counters
+            sc = int(self.send_ctr.get(peer, 0))
+            rc = int(self.recv_ctr.get(peer, 0))
+            self._set_sec_row("Anti-replay", f"send_ctr={sc}, recv_ctr={rc}")
+
+            # Key store
+            fp = self.known_keys.get(peer)
+            self._set_sec_row("Key store", "OK" if fp else "MISSING")
+            if not fp:
+                issues.append(f"No stored fingerprint for {peer}")
+
+            # Rekey policy status
+            last = self.last_rekey_time.get(peer)
+            if last:
+                age_min = int((time.time() - float(last)) / 60)
+                self._set_sec_row("Re-key policy", f"age={age_min}m, out_msgs={int(self.out_msg_count.get(peer, 0))}")
+            else:
+                self._set_sec_row("Re-key policy", f"out_msgs={int(self.out_msg_count.get(peer, 0))} (no rekey yet)")
+
+        if issues:
+            msg = f"Self-check: {len(issues)} cảnh báo"
+            try:
+                self.sec_summary.configure(text=msg)
+            except Exception:
+                pass
+            if not silent:
+                for it in issues[:5]:
+                    self.log_status(it, level="WARN")
+        else:
+            try:
+                self.sec_summary.configure(text="Self-check: OK")
+            except Exception:
+                pass
+            if not silent:
+                self.log_status("Self-check OK", level="OK")
 
     # ===== UI helpers (modern layout) =====
 
-    # NOTE: dùng Optional[str] để tương thích Python < 3.10 (tránh cú pháp `str | None`).
     def _set_connection_ui(self, status: str, detail: Optional[str] = None):
         # status: "DISCONNECTED"|"CONNECTING"|"CONNECTED"
         if status == "CONNECTED":
@@ -339,6 +915,11 @@ class ChatApp(ctk.CTk):
         w = self.conversation_widgets.get(conv_id)
         if not w:
             return
+        # pending security notices indicator
+        try:
+            w["title"].configure(text=(f"⚠ {conv_id}" if conv_id in self.notice_flags else conv_id))
+        except Exception:
+            pass
         # subtitle from last message
         hist = self.chat_history.get(conv_id, [])
         if hist:
@@ -438,7 +1019,9 @@ class ChatApp(ctk.CTk):
     def add_system_message(self, text: str, conv_id: Optional[str] = None):
         conv = conv_id or self.current_chat_partner
         ts = datetime.now().strftime("%H:%M")
-        self._append_message(conv, {"kind": "system", "text": text, "meta": ts}, bump_unread_if_inactive=False)
+
+        # marshal về UI thread
+        self.ui(self._append_message, conv, {"kind": "system", "text": text, "meta": ts}, False)
 
     def add_incoming_message(self, sender: str, text: str, encrypted: bool = False, conv_id: Optional[str] = None):
         conv = conv_id or sender
@@ -450,15 +1033,16 @@ class ChatApp(ctk.CTk):
         conv = conv_id or target
         ts = datetime.now().strftime("%H:%M")
         meta = f"{ts}" + (" • 🔒" if encrypted else "")
-        self._append_message(conv, {"kind": "chat", "direction": "out", "text": text, "meta": meta}, bump_unread_if_inactive=False)
+        self._append_message(conv, {"kind": "chat", "direction": "out", "text": text, "meta": meta},
+                            bump_unread_if_inactive=False)
 
     def ask_yesno_threadsafe(self, title: str, message: str) -> bool:
         """
         Hiển thị messagebox.askyesno an toàn thread.
         Thread receive sẽ chờ kết quả, UI không bị crash.
         """
-        import threading
-        from tkinter import messagebox
+        # import threading
+        # from tkinter import messagebox
 
         event = threading.Event()
         result = {"value": False}
@@ -475,8 +1059,10 @@ class ChatApp(ctk.CTk):
         event.wait()
         return result["value"]
 
-
     def update_chat_header(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.ui(self.update_chat_header)
+            return
         """Cập nhật tiêu đề khung chat + badges + trạng thái nút Re-key."""
         partner = self.current_chat_partner
 
@@ -489,6 +1075,7 @@ class ChatApp(ctk.CTk):
             self.rekey_button.configure(state="disabled")
             self.badge_e2ee.configure(text="E2EE: OFF")
             self.badge_id.configure(text="Identity: N/A")
+            self.update_right_panel()
             return
 
         # Private chat
@@ -683,10 +1270,10 @@ class ChatApp(ctk.CTk):
             self.ui(self._set_connection_ui, "CONNECTING")
             raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-            # TLS verify server cert (dùng path theo vị trí file để không phụ thuộc working directory)
+            # TLS verify server cert
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            ca_path = os.path.normpath(os.path.join(base_dir, "..", "certs", "server_cert.pem"))
-            context = ssl.create_default_context(cafile=ca_path)
+            cafile = os.path.normpath(os.path.join(base_dir, "..", "certs", "server_cert.pem"))
+            context = ssl.create_default_context(cafile=cafile)
             # (mặc định check_hostname=True trong create_default_context)
             tls_sock = context.wrap_socket(raw, server_hostname="SecureChatDev")
             tls_sock.connect((HOST, PORT))
@@ -698,15 +1285,15 @@ class ChatApp(ctk.CTk):
             # Handshake theo protocol
             m = self.proto.recv()
             if m["type"] != TYPE_NAME_REQ:
-                self.display_message(f"[ERROR] Expected NAME_REQ, got {m}")
+                self.post_event("STATUS", {"text": f"[ERROR] Expected NAME_REQ, got {m}", "level": "ERROR"})
                 self.client_socket.close()
-                self.ui(self._set_connection_ui, "DISCONNECTED", "Auth failed")
+                self.post_event("CONN_UI", ("DISCONNECTED", "Auth failed"))
                 return
             self.proto.send_name(name)
 
             m = self.proto.recv()
             if m["type"] == TYPE_ERROR:
-                self.display_message(f"[ERROR] {m['payload']['message']}")
+                self.display_message(f"[ERROR] {_err_text(m)}")
                 self.client_socket.close()
                 return
             if m["type"] != TYPE_AUTH_REQ:
@@ -717,7 +1304,7 @@ class ChatApp(ctk.CTk):
 
             m = self.proto.recv()
             if m["type"] == TYPE_ERROR:
-                self.display_message(f"[ERROR] Auth failed: {m['payload']['message']}")
+                self.display_message(f"[ERROR] Auth failed: {_err_text(m)}")
                 self.client_socket.close()
                 return
             if m["type"] != TYPE_AUTH_OK:
@@ -727,7 +1314,7 @@ class ChatApp(ctk.CTk):
 
             m = self.proto.recv()
             if m["type"] == TYPE_ERROR:
-                self.display_message(f"[ERROR] {m['payload']['message']}")
+                self.display_message(f"[ERROR] {_err_text(m)}")
                 self.client_socket.close()
                 return
             if m["type"] != TYPE_PUBKEY_REQ:
@@ -738,15 +1325,15 @@ class ChatApp(ctk.CTk):
             pubkey_b64 = base64.b64encode(public_key_bytes).decode("utf-8")
             self.proto.send_pubkey(pubkey_b64)
 
-            self.add_system_message("Đã kết nối thành công (TLS).", conv_id="Broadcast")
+            self.log_status("Đã kết nối thành công (TLS).", level="OK")
             self.ui(self._set_connection_ui, "CONNECTED")
             self.ui(lambda: self.self_name_label.configure(text=self.username or name))
 
             self.receive_messages()
 
         except Exception as e:
-            self.display_message(f"[ERROR] Không thể kết nối: {e}")
-            self.ui(self._set_connection_ui, "DISCONNECTED", str(e))
+            self.post_event("STATUS", {"text": f"[ERROR] Không thể kết nối: {e}", "level": "ERROR"})
+            self.post_event("CONN_UI", ("DISCONNECTED", str(e)))
             try:
                 if getattr(self, "client_socket", None):
                     self.client_socket.close()
@@ -757,10 +1344,42 @@ class ChatApp(ctk.CTk):
         while True:
             try:
                 m = self.proto.recv()
-                self.process_incoming_message(m)
+                # Network thread -> UI thread
+                self.post_event("NET_MSG", m)
             except Exception as e:
-                self.display_message(f"[ERROR] Receive loop stopped: {e}")
+                self.post_event("NET_ERR", str(e))
                 break
+
+    # def receive_messages(self):
+    #     """Vòng lặp nhận và xử lý tin nhắn từ server."""
+    #     while self.client_socket:
+    #         try:
+    #             m = self.proto.recv()  # recv_msg() -> dict hoặc raise
+    #             self.process_incoming_message(m)
+
+    #         except ProtoError as e:
+    #             # Server đóng kết nối hoặc frame lỗi
+    #             self.log_status(f"Kết nối bị đóng: {e}", level="ERROR")
+    #             break
+
+    #         except ssl.SSLError as e:
+    #             self.log_status(f"Lỗi TLS: {e}", level="ERROR")
+    #             break
+
+    #         except Exception as e:
+    #             self.log_status(f"Lỗi receive không xác định: {e}", level="ERROR")
+    #             break
+
+    #     # ---- Cleanup tập trung, CHỈ 1 LẦN ----
+    #     try:
+    #         if self.client_socket:
+    #             self.client_socket.close()
+    #     except Exception:
+    #         pass
+
+    #     self.client_socket = None
+    #     self.proto = None
+    #     self.ui(self._set_connection_ui, "DISCONNECTED", "Connection closed")
 
     def process_incoming_message(self, m: dict):
         """Process incoming message based on message type."""
@@ -819,37 +1438,28 @@ class ChatApp(ctk.CTk):
                 # Check if fingerprint matches
                 old_fp = self.known_keys[name]
                 if old_fp != fp:
-                    self.display_message(f"[WARNING] Public key của {name} đã thay đổi!")
-                    self.display_message(f"  - Fingerprint cũ : {old_fp}")
-                    self.display_message(f"  - Fingerprint mới: {fp}")
-                    self.display_message(">> Có thể là tấn công MITM hoặc người đó vừa đổi thiết bị / cài lại app.")
+                    # Do not popup. Store as pending and warn only when user opens that chat.
+                    self.peer_trust[name] = "CHANGED"
+                    self.pending_key_changes[name] = {"old_fp": old_fp, "new_fp": fp, "pubkey_bytes": pubkey_bytes}
+                    self._refresh_conversation_tile(name)
+                    self._ensure_conversation_tile(name)
 
-                    accept = self.ask_yesno_threadsafe(
-                        "Cảnh báo bảo mật",
-                        (
-                            f"Fingerprint của {name} đã thay đổi.\n\n"
-                            f"Cũ : {old_fp}\nMới: {fp}\n\n"
-                            "Nếu bạn ĐÃ xác minh qua kênh khác rằng đây thật sự là key mới của họ,\n"
-                            "hãy chọn 'Yes' để chấp nhận key mới.\n\n"
-                            "Nếu không chắc chắn, hãy chọn 'No' để từ chối (giữ key cũ)."
-                        )
+                    self.log_status(f"Security: identity changed for {name}. Open chat to review.", level="WARN")
+                    self._queue_security_notice(
+                        name,
+                        f"[SECURITY] Public key của {name} đã thay đổi.\n"
+                        f"• Cũ: {old_fp}\n"
+                        f"• Mới: {fp}\n\n"
+                        "Đây có thể là đổi thiết bị hoặc tấn công MITM.\n"
+                        "Vào tab Info để 'Accept New Key' nếu bạn đã xác minh fingerprint ngoài kênh."
                     )
-
-                    if accept:
-                        self.known_keys[name] = fp
-                        self.peer_trust[name] = "CHANGED"
-                        self._refresh_conversation_tile(name)
-                        self.save_known_keys()
-                        self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
-                        self.display_message(f"[INFO] Bạn đã chấp nhận public key mới của {name}.")
-                        self.ui(self.add_user_button, name)
-                    else:
-                        self.peer_trust[name] = "CHANGED"
-                        self._refresh_conversation_tile(name)
-                        self.display_message(f"[INFO] Bạn đã từ chối public key mới của {name}.")
                     return
 
             # Save public key and add to user list
+            if name in self.pending_key_changes:
+                # awaiting user decision; do not overwrite current directory key
+                self.ui(self.add_user_button, name)
+                return
             self.user_directory[name] = load_public_key_from_bytes(pubkey_bytes)
             if name not in self.peer_trust:
                 self.peer_trust[name] = "TOFU"
@@ -874,7 +1484,10 @@ class ChatApp(ctk.CTk):
 
                 signed = build_session_offer_sig_bytes(sender_name, self.username, session_id, encrypted_key_b64)
                 if not rsa_verify_pss_sha256(sender_pub, b64d(sig_b64), signed):
-                    self.display_message(f"[WARNING] SESSION_OFFER từ {sender_name} có signature KHÔNG hợp lệ -> bỏ qua.")
+                    self._queue_security_notice(
+                        sender_name,
+                        f"[SECURITY] SESSION_OFFER từ {sender_name} có chữ ký KHÔNG hợp lệ. Đã bỏ qua (có thể bị MITM/giả mạo)."
+                    )
                     return
 
                 encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
@@ -949,13 +1562,19 @@ class ChatApp(ctk.CTk):
                     return
 
                 if sender_name not in self.session_keys:
-                    self.display_message(f"[INFO] Nhận tin mã hóa từ {sender_name} nhưng chưa có khóa.")
+                    self._queue_security_notice(
+                        sender_name,
+                        f"[SECURITY] Nhận PRIVATE_MSG từ {sender_name} nhưng chưa có session key. Tin nhắn đã bị bỏ qua."
+                    )
                     return
 
                 ctr = int(ctr)
                 last = self.recv_ctr.get(sender_name, 0)
-                if ctr <= last:
-                    self.display_message(f"[WARNING] Replay/Out-of-order từ {sender_name}: ctr={ctr} <= last={last} -> drop")
+                if ctr != last + 1:
+                    self._queue_security_notice(
+                        sender_name,
+                        f"[SECURITY] Replay/Out-of-order từ {sender_name}: ctr={ctr} <= last={last}. Tin nhắn đã bị bỏ qua."
+                    )
                     return
 
                 session_key = self.session_keys[sender_name]
@@ -968,9 +1587,27 @@ class ChatApp(ctk.CTk):
                     self.recv_ctr[sender_name] = ctr
                     self.add_incoming_message(sender_name, decrypted_text.decode("utf-8"), encrypted=True)
                 else:
-                    self.display_message(f"[ERROR] Không thể giải mã tin nhắn từ {sender_name} (ctr={ctr}).")
+                    self._queue_security_notice(
+                        sender_name,
+                        f"[SECURITY] Không thể giải mã PRIVATE_MSG từ {sender_name} (ctr={ctr}). Có thể lệch khóa hoặc bị sửa đổi."
+                    )
+
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý PRIVATE_MSG: {e}")
+
+        elif msg_type == TYPE_DIRECT_MSG:
+            try:
+                sender_name = payload.get("from")
+                text = payload.get("text", "")
+                if not sender_name:
+                    return
+                if sender_name == self.username:
+                    return
+                # Ensure conversation and append
+                self._ensure_conversation_tile(sender_name)
+                self.add_incoming_message(sender_name, text, encrypted=False)
+            except Exception as e:
+                self.display_message(f"[ERROR] Lỗi xử lý DIRECT_MSG: {e}")
 
         elif msg_type == TYPE_BROADCAST:
             try:
@@ -1006,44 +1643,52 @@ class ChatApp(ctk.CTk):
             except Exception as e:  # noqa: BLE001
                 self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn broadcast: {e}")
         else:
-            # Nếu đang handshake/rekey (chưa ACK) thì block để tránh lệch key
-            if not self.session_confirmed.get(target, False):
-                self.display_message(f"[INFO] Đang (re)key với {target}, vui lòng đợi ACK rồi gửi lại.")
-                self.entry_message.delete(0, "end")
-                return
-
-            if target in self.session_keys:
+            # Default: plaintext direct message unless E2EE is enabled for this chat
+            if not self.e2ee_enabled.get(target, False):
                 try:
-                    session_key = self.session_keys[target]
-
-                    # ctr tăng dần cho anti-replay
-                    ctr = self.send_ctr.get(target, 0) + 1
-                    self.send_ctr[target] = ctr
-
-                    aad = f"{self.username}|{target}|{ctr}".encode("utf-8")
-                    encrypted_bytes = aes_encrypt(msg.encode("utf-8"), session_key, associated_data=aad)
-                    if encrypted_bytes is None:
-                        self.display_message("[ERROR] Mã hóa thất bại, không gửi tin nhắn.")
-                        return
-
-                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode("utf-8")
-
-                    # Gửi kèm ctr
-                    self.proto.send_private_msg(target, encrypted_b64, ctr)
-
-                    self.add_outgoing_message(target, msg, encrypted=True)
-
-                    # track count cho auto rekey
-                    self.out_msg_count[target] = self.out_msg_count.get(target, 0) + 1
-
-                    # gọi auto rekey sau khi gửi (không phá message hiện tại)
-                    self.maybe_auto_rekey(target)
-
+                    self.proto.send_direct_msg(target, msg)
+                    self.add_outgoing_message(target, msg, encrypted=False)
                 except Exception as e:
-                    self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn: {e}")
+                    self.display_message(f"[ERROR] Lỗi khi gửi DIRECT_MSG: {e}")
             else:
-                self.display_message(f"[ERROR] Chưa có khóa với {target}. Đang yêu cầu kết nối...")
-                self.perform_handshake(target)
+                # If peer identity changed and not accepted, block E2EE until user accepts new key.
+                if target in self.pending_key_changes:
+                    self._queue_security_notice(
+                        target,
+                        "[SECURITY] Không thể bật E2EE vì identity của peer đã thay đổi. "
+                        "Vào tab Info để Accept New Key sau khi bạn xác minh fingerprint."
+                    )
+                elif not self.session_confirmed.get(target, False):
+                    self._queue_security_notice(target, "[SYSTEM] Đang thiết lập phiên E2EE…")
+                    self.perform_handshake(target)
+                else:
+                    try:
+                        aes_key = self.session_keys[target]
+
+                        ctr = self.send_ctr.get(target, 0) + 1
+                        self.send_ctr[target] = ctr
+                        aad = f"{self.username}|{target}|{ctr}".encode("utf-8")
+
+                        encrypted_bytes = aes_encrypt(
+                            msg.encode("utf-8"),
+                            aes_key,
+                            associated_data=aad
+                        )
+                        if encrypted_bytes is None:
+                            self.display_message("[ERROR] Mã hóa thất bại, không gửi được.")
+                            self.entry_message.delete(0, "end")
+                            return
+
+                        encrypted_b64 = base64.b64encode(encrypted_bytes).decode("utf-8")
+
+                        self.proto.send_private_msg(target, encrypted_b64, ctr)
+                        self.add_outgoing_message(target, msg, encrypted=True)
+
+                        self.out_msg_count[target] = self.out_msg_count.get(target, 0) + 1
+                        self.maybe_auto_rekey(target)
+
+                    except Exception as e:
+                        self.display_message(f"[ERROR] Lỗi khi gửi PRIVATE_MSG: {e}")
 
         self.entry_message.delete(0, "end")
     
@@ -1059,16 +1704,21 @@ class ChatApp(ctk.CTk):
     def select_chat_partner(self, name):
         self.current_chat_partner = name
         self.unread[name] = 0
+        self._flush_security_notices_if_any(name)
         self._refresh_conversation_tile(name)
         self._render_conversation(name)
 
-        if name not in self.session_keys:
-            self.add_system_message(f"Đang thiết lập mã hóa E2EE với {name}...", conv_id=name)
+        # Update header + right panel
+        self.update_chat_header()
+        self.update_right_panel()
+
+        # Auto-handshake only when needed
+        if self.e2ee_enabled.get(name, False) and name not in self.session_keys:
+            self.log_status(f"Switch to {name}: starting E2EE setup...", level="INFO")
             self.perform_handshake(name)
         else:
-            self.add_system_message(f"Đã chuyển sang chế độ chat an toàn với {name}.", conv_id=name)
+            self.log_status(f"Switched to {name}.", level="OK")
 
-        self.ui(self.update_chat_header)
 
 
     def select_broadcast(self):
@@ -1077,8 +1727,11 @@ class ChatApp(ctk.CTk):
         self.unread["Broadcast"] = 0
         self._refresh_conversation_tile("Broadcast")
         self._render_conversation("Broadcast")
-        self.add_system_message("Đã chuyển sang phòng chat chung (Broadcast).", conv_id="Broadcast")
-        self.ui(self.update_chat_header)
+        self.update_chat_header()
+        self.update_right_panel()
+        self.log_status("Switched to Broadcast room.", level="OK")
+
+
 
     def perform_handshake(self, target_name):
         """Tạo AES key, mã hóa bằng RSA của target và gửi SESSION_OFFER."""
@@ -1210,18 +1863,11 @@ class ChatApp(ctk.CTk):
     # Trong client_gui.py -> class ChatApp
 
     def display_message(self, text):
-        # Backwards-compatible: route all legacy logs to a system message in the current conversation
-        try:
-            self.after(0, lambda: self.add_system_message(str(text)))
-        except Exception:
-            pass
+        # Route legacy logs into Activity (status/notifications) to avoid clutter in chat
+        self.log_status(str(text), level="INFO")
 
     def _safe_display_message(self, text):
-        # Legacy hook kept for compatibility (no longer writes to a textbox)
-        try:
-            self.add_system_message(str(text))
-        except Exception:
-            pass
+        self.log_status(str(text), level="INFO")
 
 
 
