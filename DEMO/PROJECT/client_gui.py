@@ -85,8 +85,13 @@ class ChatApp(ctk.CTk):
 
         self.send_ctr = {}                  # {name: int}
         self.recv_ctr = {}                  # {name: int}
+        self.in_msg_count = {}              # {name: int}
         self.out_msg_count = {}             # {name: int}
         self.last_rekey_time = {}           # {name: float}
+        
+        # One active outgoing handshake per peer
+        self.active_session_id = {}      # peer -> session_id
+        self.pending_handshake_deadline = {}  # peer -> epoch seconds (timeout)
 
         self.current_chat_partner = "Broadcast"
         # ===== Thread-safe event queue (network thread -> UI thread) =====
@@ -419,6 +424,44 @@ class ChatApp(ctk.CTk):
             self._event_q.put((kind, payload))
         except Exception:
             pass
+    
+    def _purge_peer_state(self, peer: str) -> None:
+        # crypto/session
+        self.session_keys.pop(peer, None)
+        self.session_confirmed.pop(peer, None)
+        self.last_rekey_time.pop(peer, None)
+
+        # counters
+        self.send_ctr.pop(peer, None)
+        self.recv_ctr.pop(peer, None)
+
+        # ui/security notices
+        self.pending_notices.pop(peer, None)
+        if peer in self.notice_flags:
+            self.notice_flags.remove(peer)
+
+        # key change workflow
+        self.pending_key_changes.pop(peer, None)
+
+        # e2ee toggle + stats
+        self.e2ee_enabled.pop(peer, None)
+        self.in_msg_count.pop(peer, None)
+        self.out_msg_count.pop(peer, None)
+        
+        for k in list(self.pending_session_acks.keys()):
+            if k[0] == peer:
+                self.pending_session_acks.pop(k, None)
+        # Also drop pending handshake markers
+        self._drop_pending_sessions_for_peer(peer)
+
+    def _drop_pending_sessions_for_peer(self, peer: str) -> None:
+        # Remove all pending_session_acks for this peer
+        for k in list(self.pending_session_acks.keys()):
+            if isinstance(k, tuple) and len(k) >= 1 and k[0] == peer:
+                self.pending_session_acks.pop(k, None)
+
+        self.active_session_id.pop(peer, None)
+        self.pending_handshake_deadline.pop(peer, None)
 
     def _pump_events(self) -> None:
         """Runs on UI thread; drains queued events and dispatches handlers."""
@@ -579,9 +622,18 @@ class ChatApp(ctk.CTk):
             self.update_right_panel()
             return
 
+        # Enabling E2EE
         self._queue_security_notice(peer, "[SYSTEM] Đang bật E2EE cho cuộc trò chuyện này…")
+
+        # Nếu đã có offer pending từ peer thì accept luôn (ưu tiên), khỏi phải handshake ngược
+        if self._accept_stored_offer_if_any(peer):
+            self.update_chat_header()
+            self.update_right_panel()
+            return
+
         if peer not in self.session_keys or not self.session_confirmed.get(peer, False):
             self.perform_handshake(peer)
+
         self.update_chat_header()
         self.update_right_panel()
 
@@ -714,7 +766,7 @@ class ChatApp(ctk.CTk):
         # Otherwise, defer until the user opens that chat.
         self.pending_notices.setdefault(peer, []).append(msg)
         self.notice_flags.add(peer)
-        self._refresh_conversation_tile(peer)
+        self.ui(self._refresh_conversation_tile, peer)
 
     def _flush_security_notices_if_any(self, peer: str) -> None:
         notes = self.pending_notices.get(peer) or []
@@ -912,6 +964,9 @@ class ChatApp(ctk.CTk):
         self._refresh_conversation_tile(conv_id)
 
     def _refresh_conversation_tile(self, conv_id: str):
+        if threading.current_thread() is not threading.main_thread():
+            self.ui(self._refresh_conversation_tile, conv_id)
+            return
         w = self.conversation_widgets.get(conv_id)
         if not w:
             return
@@ -948,6 +1003,9 @@ class ChatApp(ctk.CTk):
         self._msg_row = 0
 
     def _render_conversation(self, conv_id: str):
+        if threading.current_thread() is not threading.main_thread():
+            self.ui(self._render_conversation, conv_id)
+            return
         self._clear_message_area()
         for msg in self.chat_history.get(conv_id, []):
             self._render_message_bubble(msg)
@@ -1341,45 +1399,31 @@ class ChatApp(ctk.CTk):
                 pass
 
     def receive_messages(self):
-        while True:
-            try:
+        """Network receive loop (runs in background thread). Ensures cleanup on disconnect."""
+        try:
+            while True:
                 m = self.proto.recv()
-                # Network thread -> UI thread
                 self.post_event("NET_MSG", m)
-            except Exception as e:
-                self.post_event("NET_ERR", str(e))
-                break
+        except Exception as e:
+            self.post_event("NET_ERR", str(e))
+        finally:
+            # ---- Cleanup: close socket once, reset state, update UI ----
+            try:
+                if getattr(self, "client_socket", None):
+                    try:
+                        self.client_socket.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    try:
+                        self.client_socket.close()
+                    except Exception:
+                        pass
+            finally:
+                self.client_socket = None
+                self.proto = None
 
-    # def receive_messages(self):
-    #     """Vòng lặp nhận và xử lý tin nhắn từ server."""
-    #     while self.client_socket:
-    #         try:
-    #             m = self.proto.recv()  # recv_msg() -> dict hoặc raise
-    #             self.process_incoming_message(m)
-
-    #         except ProtoError as e:
-    #             # Server đóng kết nối hoặc frame lỗi
-    #             self.log_status(f"Kết nối bị đóng: {e}", level="ERROR")
-    #             break
-
-    #         except ssl.SSLError as e:
-    #             self.log_status(f"Lỗi TLS: {e}", level="ERROR")
-    #             break
-
-    #         except Exception as e:
-    #             self.log_status(f"Lỗi receive không xác định: {e}", level="ERROR")
-    #             break
-
-    #     # ---- Cleanup tập trung, CHỈ 1 LẦN ----
-    #     try:
-    #         if self.client_socket:
-    #             self.client_socket.close()
-    #     except Exception:
-    #         pass
-
-    #     self.client_socket = None
-    #     self.proto = None
-    #     self.ui(self._set_connection_ui, "DISCONNECTED", "Connection closed")
+            # UI: mark disconnected
+            self.post_event("CONN_UI", ("DISCONNECTED", "Connection closed"))
 
     def process_incoming_message(self, m: dict):
         """Process incoming message based on message type."""
@@ -1397,30 +1441,30 @@ class ChatApp(ctk.CTk):
                 return
 
             if pubkey_b64 is None:
-                # User offline: remove from directory and UI (thread-safe)
+                # User offline
                 self.display_message(f"[INFO] {name} vừa offline.")
 
-                # Xóa dữ liệu liên quan
-                self.user_directory.pop(name, None)
-                self.session_keys.pop(name, None)
-                self.session_confirmed.pop(name, None)
-                self.send_ctr.pop(name, None)
-                self.recv_ctr.pop(name, None)
-                self.out_msg_count.pop(name, None)
-                self.last_rekey_time.pop(name, None)
+                # 1) Dọn sạch mọi state liên quan peer (E2EE, ctr, notices, pending...)
+                self._purge_peer_state(name)
 
-                # Drop pending ACKs liên quan
+                # 2) Drop pending ACKs liên quan (nếu bạn chưa đưa vào _purge_peer_state)
                 for k in list(self.pending_session_acks.keys()):
                     if k[0] == name:
                         self.pending_session_acks.pop(k, None)
 
-                # Xóa nút UI trên main thread
+                # 3) Cập nhật UI list/tile: xoá user khỏi sidebar (chạy trên main thread)
                 self.ui(self.remove_user_button, name)
-
-                # Nếu đang chat với user vừa offline -> quay về Broadcast để UI không “đụng” session cũ
+                # Note: không xoá hẳn conversation tile để giữ lịch sử chat
+                # self._ensure_conversation_tile(name)
+                # self._refresh_conversation_tile(name)
+                # 4) Nếu đang chat với user vừa offline -> chuyển về Broadcast để tránh UI đụng state cũ
                 if self.current_chat_partner == name:
                     self.current_chat_partner = "Broadcast"
+                    self.unread["Broadcast"] = 0
                     self.ui(self.update_chat_header)
+                    self.ui(self.update_right_panel)
+                    self.ui(self._render_conversation, "Broadcast")
+                    self.ui(self._refresh_conversation_tile, "Broadcast")
 
                 return
 
@@ -1477,22 +1521,47 @@ class ChatApp(ctk.CTk):
                     self.display_message(f"[ERROR] SESSION_OFFER không hợp lệ: {m}")
                     return
 
+                # Nếu identity đang CHANGED/pending -> tuyệt đối không nhận offer
+                if sender_name in self.pending_key_changes:
+                    self._queue_security_notice(
+                        sender_name,
+                        "[SECURITY] Peer đang có key change pending. Bỏ qua SESSION_OFFER cho đến khi bạn Accept New Key."
+                    )
+                    return
+
                 sender_pub = self.user_directory.get(sender_name)
                 if sender_pub is None:
                     self.display_message(f"[ERROR] Chưa có public key của {sender_name} -> bỏ qua SESSION_OFFER.")
                     return
 
+                # Verify chữ ký offer
                 signed = build_session_offer_sig_bytes(sender_name, self.username, session_id, encrypted_key_b64)
                 if not rsa_verify_pss_sha256(sender_pub, b64d(sig_b64), signed):
                     self._queue_security_notice(
                         sender_name,
-                        f"[SECURITY] SESSION_OFFER từ {sender_name} có chữ ký KHÔNG hợp lệ. Đã bỏ qua (có thể bị MITM/giả mạo)."
+                        f"[SECURITY] SESSION_OFFER từ {sender_name} có chữ ký KHÔNG hợp lệ. Đã bỏ qua."
                     )
                     return
 
+                # Decrypt AES key
                 encrypted_key_bytes = base64.b64decode(encrypted_key_b64)
                 aes_key = rsa_decrypt(encrypted_key_bytes, self.my_private_key)
 
+                # Nếu E2EE đang OFF cho chat này: lưu offer, KHÔNG ack
+                if not self.e2ee_enabled.get(sender_name, False):
+                    self.session_offers[sender_name] = {
+                        "session_id": session_id,
+                        "aes_key": aes_key,
+                        "timestamp": time.time(),
+                    }
+                    self._queue_security_notice(
+                        sender_name,
+                        "[SYSTEM] Peer đã gửi lời mời E2EE, nhưng chat này đang ở plaintext (E2EE OFF). "
+                        "Bật E2EE (switch) nếu bạn muốn chấp nhận."
+                    )
+                    return
+
+                # E2EE đang ON -> accept ngay
                 self.session_keys[sender_name] = aes_key
                 self.send_ctr[sender_name] = 0
                 self.recv_ctr[sender_name] = 0
@@ -1503,8 +1572,9 @@ class ChatApp(ctk.CTk):
                 confirm_hex = session_confirm_token(aes_key, session_id)
                 self.proto.send_session_ack(sender_name, session_id, confirm_hex)
 
-                self.display_message(f"[SYSTEM] Đã thiết lập E2EE với {sender_name} (session_id={session_id}) và gửi ACK.")
+                self._queue_security_notice(sender_name, f"[SYSTEM] Đã thiết lập E2EE với {sender_name} (session_id={session_id}) và gửi ACK.")
                 self.ui(self.update_chat_header)
+                self.ui(self.update_right_panel)
 
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý SESSION_OFFER: {e}")
@@ -1514,6 +1584,13 @@ class ChatApp(ctk.CTk):
                 sender_name = payload.get("from")
                 session_id = payload.get("session_id")
                 confirm_hex = payload.get("confirm_hex")
+                expected_sid = self.active_session_id.get(sender_name)
+                if expected_sid and session_id != expected_sid:
+                    self._queue_security_notice(
+                        sender_name,
+                        f"[SECURITY] SESSION_ACK session_id mismatch (got={session_id}, expected={expected_sid}). Bỏ qua."
+                    )
+                    return
 
                 if not sender_name or not session_id or not confirm_hex:
                     self.display_message(f"[ERROR] SESSION_ACK không hợp lệ: {m}")
@@ -1526,12 +1603,14 @@ class ChatApp(ctk.CTk):
                     )
                     return
 
+                # ===== XÁC MINH confirm_hex hợp lệ (confirm OK) =====
                 expected = session_confirm_token(key, session_id)
                 if expected != confirm_hex:
                     self.display_message(
                         f"[WARNING] ACK của {sender_name} KHÔNG khớp (session_id={session_id})."
                     )
                     return
+                # ===== confirm_hex HỢPLỆ => tiếp tục commit key =====
 
                 # Commit key mới + reset state (cực quan trọng cho re-key)
                 self.session_keys[sender_name] = key
@@ -1542,55 +1621,76 @@ class ChatApp(ctk.CTk):
                 self.recv_ctr[sender_name] = 0
                 self.out_msg_count[sender_name] = 0
                 self.last_rekey_time[sender_name] = time.time()
+                
+                # Clear handshake tracking
+                self.active_session_id.pop(sender_name, None)
+                self.pending_handshake_deadline.pop(sender_name, None)
 
-                self.display_message(
-                    f"[SECURE] {sender_name} đã ACK thành công. Kênh E2EE được xác nhận (session_id={session_id})."
-                )
+                self._queue_security_notice(sender_name, f"[SYSTEM] E2EE confirmed (ACK) (session_id={session_id}).")
                 self.ui(self.update_chat_header)
+                self.ui(self.update_right_panel)
 
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý SESSION_ACK: {e}")
 
         elif msg_type == TYPE_PRIVATE_MSG:
-            try:
+            try:                
                 sender_name = payload.get("from")
                 ciphertext_b64 = payload.get("ciphertext_b64")
-                ctr = payload.get("ctr")
+                ctr_raw = payload.get("ctr")
 
-                if not sender_name or not ciphertext_b64 or ctr is None:
-                    self.display_message(f"[ERROR] PRIVATE_MSG không hợp lệ: {m}")
+                if not sender_name or not ciphertext_b64 or ctr_raw is None:
+                    # bỏ qua yên lặng hoặc log
+                    self._queue_security_notice(sender_name or "Unknown",
+                        "[SECURITY] PRIVATE_MSG thiếu field bắt buộc (from/ciphertext_b64/ctr).")
                     return
 
-                if sender_name not in self.session_keys:
-                    self._queue_security_notice(
-                        sender_name,
-                        f"[SECURITY] Nhận PRIVATE_MSG từ {sender_name} nhưng chưa có session key. Tin nhắn đã bị bỏ qua."
-                    )
+                # ctr validation
+                try:
+                    ctr = int(ctr_raw)
+                    if ctr <= 0:
+                        raise ValueError("ctr must be > 0")
+                except Exception:
+                    self._queue_security_notice(sender_name,
+                        f"[SECURITY] ctr không hợp lệ: {ctr_raw!r}. Tin nhắn bị bỏ qua.")
                     return
 
-                ctr = int(ctr)
-                last = self.recv_ctr.get(sender_name, 0)
-                if ctr != last + 1:
-                    self._queue_security_notice(
-                        sender_name,
-                        f"[SECURITY] Replay/Out-of-order từ {sender_name}: ctr={ctr} <= last={last}. Tin nhắn đã bị bỏ qua."
-                    )
+                last = int(self.recv_ctr.get(sender_name, 0))
+                if ctr <= last:
+                    self._queue_security_notice(sender_name,
+                        f"[SECURITY] Replay/Out-of-order: ctr={ctr} <= last={last}. Tin nhắn bị bỏ qua.")
                     return
 
-                session_key = self.session_keys[sender_name]
-                encrypted_bytes = base64.b64decode(ciphertext_b64)
+                # require confirmed session (giảm decrypt fail “giả”)
+                if not self.session_confirmed.get(sender_name, False):
+                    self._queue_security_notice(sender_name,
+                        "[SECURITY] Nhận PRIVATE_MSG khi session chưa confirmed. Tin nhắn bị bỏ qua.")
+                    return
+
+                session_key = self.session_keys.get(sender_name)
+                if not session_key:
+                    self._queue_security_notice(sender_name,
+                        "[SECURITY] Nhận PRIVATE_MSG nhưng chưa có session key. Tin nhắn bị bỏ qua.")
+                    return
+
+                # base64 decode harden
+                try:
+                    encrypted_bytes = base64.b64decode(ciphertext_b64, validate=True)
+                except Exception:
+                    self._queue_security_notice(sender_name,
+                        "[SECURITY] ciphertext_b64 không hợp lệ (base64 decode fail). Tin nhắn bị bỏ qua.")
+                    return
 
                 aad = f"{sender_name}|{self.username}|{ctr}".encode("utf-8")
-                decrypted_text = aes_decrypt(encrypted_bytes, session_key, associated_data=aad)
+                decrypted = aes_decrypt(encrypted_bytes, session_key, associated_data=aad)
+                if decrypted is None:
+                    self._queue_security_notice(sender_name,
+                        f"[SECURITY] Không thể giải mã (ctr={ctr}). Có thể lệch khóa hoặc bị sửa đổi.")
+                    return
 
-                if decrypted_text:
-                    self.recv_ctr[sender_name] = ctr
-                    self.add_incoming_message(sender_name, decrypted_text.decode("utf-8"), encrypted=True)
-                else:
-                    self._queue_security_notice(
-                        sender_name,
-                        f"[SECURITY] Không thể giải mã PRIVATE_MSG từ {sender_name} (ctr={ctr}). Có thể lệch khóa hoặc bị sửa đổi."
-                    )
+                self.recv_ctr[sender_name] = ctr
+                self.in_msg_count[sender_name] = self.in_msg_count.get(sender_name, 0) + 1
+                self.add_incoming_message(sender_name, decrypted.decode("utf-8"), encrypted=True)
 
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý PRIVATE_MSG: {e}")
@@ -1712,14 +1812,55 @@ class ChatApp(ctk.CTk):
         self.update_chat_header()
         self.update_right_panel()
 
-        # Auto-handshake only when needed
-        if self.e2ee_enabled.get(name, False) and name not in self.session_keys:
-            self.log_status(f"Switch to {name}: starting E2EE setup...", level="INFO")
-            self.perform_handshake(name)
+        # Auto-handshake only when E2EE is enabled for this chat
+        if name and name != "Broadcast" and self.e2ee_enabled.get(name, False):
+            if (name not in self.session_keys) or (not self.session_confirmed.get(name, False)):
+                self.log_status(f"Switch to {name}: starting E2EE setup...", level="INFO")
+                self.perform_handshake(name)
         else:
             self.log_status(f"Switched to {name}.", level="OK")
 
+    def _check_handshake_timeout(self, peer: str) -> None:
+        """UI-thread: nếu pending handshake quá hạn thì reset để tránh kẹt."""
+        try:
+            if not peer or peer == "Broadcast":
+                return
 
+            # Nếu đã confirmed thì clear pending markers và thôi
+            if self.session_confirmed.get(peer, False):
+                self.active_session_id.pop(peer, None)
+                self.pending_handshake_deadline.pop(peer, None)
+                return
+
+            deadline = self.pending_handshake_deadline.get(peer)
+            sid = self.active_session_id.get(peer)
+
+            if not deadline or not sid:
+                return
+
+            if time.time() <= float(deadline):
+                # Chưa quá hạn -> check lại sau
+                self.after(500, lambda p=peer: self._check_handshake_timeout(p))
+                return
+
+            # Timeout -> drop pending
+            self.pending_session_acks.pop((peer, sid), None)
+            self.active_session_id.pop(peer, None)
+            self.pending_handshake_deadline.pop(peer, None)
+            self.session_confirmed[peer] = False
+
+            # Nếu user đang bật E2EE cho chat này: báo rõ và (tuỳ chọn) tắt switch
+            self._queue_security_notice(peer, "[SECURITY] Handshake E2EE bị timeout (không nhận ACK). Bạn có thể thử bật lại E2EE hoặc Re-key.")
+            if self.current_chat_partner == peer:
+                # Option: giữ switch ON nhưng hiển thị NEGOTIATING; hoặc tắt luôn để rõ ràng:
+                # self.e2ee_enabled[peer] = False
+                # try: self.switch_e2ee.deselect()
+                # except Exception: pass
+                self.update_chat_header()
+                self.update_right_panel()
+
+        except Exception:
+            pass
 
     def select_broadcast(self):
         """Chuyển về phòng chat chung (Broadcast), không mã hóa E2EE."""
@@ -1731,7 +1872,41 @@ class ChatApp(ctk.CTk):
         self.update_right_panel()
         self.log_status("Switched to Broadcast room.", level="OK")
 
+    def _accept_stored_offer_if_any(self, peer: str) -> bool:
+        """Accept a previously stored SESSION_OFFER when user enables E2EE. Returns True if accepted."""
+        try:
+            offer = self.session_offers.get(peer)
+            if not offer:
+                return False
 
+            session_id = offer.get("session_id")
+            aes_key = offer.get("aes_key")
+            if not session_id or not aes_key:
+                self.session_offers.pop(peer, None)
+                return False
+
+            # Commit key + reset counters
+            self.session_keys[peer] = aes_key
+            self.send_ctr[peer] = 0
+            self.recv_ctr[peer] = 0
+            self.out_msg_count[peer] = 0
+            self.last_rekey_time[peer] = time.time()
+            self.session_confirmed[peer] = True
+
+            # Send ACK now
+            confirm_hex = session_confirm_token(aes_key, session_id)
+            self.proto.send_session_ack(peer, session_id, confirm_hex)
+
+            # Clear stored offer
+            self.session_offers.pop(peer, None)
+
+            self._queue_security_notice(peer, f"[SYSTEM] Đã chấp nhận lời mời E2EE đã lưu (session_id={session_id}) và gửi ACK.")
+            self.ui(self.update_chat_header)
+            self.ui(self.update_right_panel)
+            return True
+        except Exception as e:
+            self._queue_security_notice(peer, f"[ERROR] Accept stored offer failed: {e}")
+            return False
 
     def perform_handshake(self, target_name):
         """Tạo AES key, mã hóa bằng RSA của target và gửi SESSION_OFFER."""
@@ -1741,36 +1916,59 @@ class ChatApp(ctk.CTk):
         if target_name not in self.user_directory:
             self.display_message(f"[ERROR] Không tìm thấy người dùng: {target_name}.")
             return
-        if target_name in self.session_keys:
-            self.display_message(f"[INFO] Đã có khóa với {target_name}.")
-            self.ui(self.update_chat_header)
 
+        # Nếu đang có pending handshake trước đó -> drop để tránh kẹt
+        try:
+            self._drop_pending_sessions_for_peer(target_name)
+        except Exception:
+            # nếu bạn chưa add helper hoặc đổi tên, không để crash
+            pass
+        
+        # Nếu đã có session confirmed thì không handshake lại (tránh spam)
+        if self.session_confirmed.get(target_name, False) and target_name in self.session_keys:
+            self.display_message(f"[INFO] Đã có khóa (confirmed) với {target_name}.")
+            self.ui(self.update_chat_header)
             return
+
+        # Nếu có key nhưng chưa confirmed, vẫn cho handshake lại (re-key / retry)
+        # Drop toàn bộ pending cũ cho peer này trước khi tạo session mới
+        try:
+            self._drop_pending_sessions_for_peer(target_name)
+        except Exception:
+            # nếu bạn chưa add helper hoặc đổi tên, không để crash
+            pass
 
         try:
             target_pubkey_obj = self.user_directory[target_name]
             aes_key = generate_aes_key()
             encrypted_aes_key = rsa_encrypt(aes_key, target_pubkey_obj)
 
-            # Lưu key local trước (để bạn có thể mã hóa ngay lập tức nếu muốn)
-            self.session_keys[target_name] = aes_key
-
             encrypted_key_b64 = base64.b64encode(encrypted_aes_key).decode("utf-8")
             session_id = uuid.uuid4().hex
+
+            # Track pending ACK + mark negotiating
             self.pending_session_acks[(target_name, session_id)] = aes_key
             self.session_confirmed[target_name] = False
+
+            # Gắn active session id + deadline để chống kẹt pending
+            self.active_session_id[target_name] = session_id
+            self.pending_handshake_deadline[target_name] = time.time() + 12.0  # 12s timeout
+
             sig_bytes = build_session_offer_sig_bytes(self.username, target_name, session_id, encrypted_key_b64)
             sig_b64 = b64e(rsa_sign_pss_sha256(self.my_private_key, sig_bytes))
 
             self.proto.send_session_offer(target_name, session_id, encrypted_key_b64, sig_b64)
-            self.display_message(f"[SYSTEM] Đã gửi lời mời E2EE đến {target_name}.")
-            # FIX: cập nhật header + enable Re-key nếu đang chat với user này
+
+            self._queue_security_notice(target_name, f"[SYSTEM] Đã gửi lời mời E2EE (session_id={session_id}). Đang chờ ACK…")
             self.ui(self.update_chat_header)
 
+            # Schedule timeout check (UI thread)
+            self.after(500, lambda p=target_name: self._check_handshake_timeout(p))
 
         except Exception as e:  # noqa: BLE001
-            self.display_message(f"[ERROR] Lỗi khi bắt tay với {target_name}: {e}")
-
+            self._queue_security_notice(target_name, f"[ERROR] Lỗi khi bắt tay với {target_name}: {e}")
+            self.ui(self.update_chat_header)
+    
     def maybe_auto_rekey(self, target: str) -> None:
         """
         Auto re-key theo timer / message-count.
@@ -1863,6 +2061,9 @@ class ChatApp(ctk.CTk):
     # Trong client_gui.py -> class ChatApp
 
     def display_message(self, text):
+        if threading.current_thread() is not threading.main_thread():
+            self.ui(self.display_message, text)
+            return
         # Route legacy logs into Activity (status/notifications) to avoid clutter in chat
         self.log_status(str(text), level="INFO")
 

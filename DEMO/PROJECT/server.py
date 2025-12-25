@@ -299,6 +299,21 @@ def handle_client(sock: socket.socket):
             "type": TYPE_USER_ANNOUNCE,
             "payload": {"name": name, "pubkey_b64": pub_b64}
         })
+        
+        # ---- HELPERS ----
+        def _pget(d: dict, *keys, default=None):
+            """payload getter: try top-level then payload dict."""
+            if not isinstance(d, dict):
+                return default
+            for k in keys:
+                if k in d:
+                    return d.get(k, default)
+            payload = d.get("payload")
+            if isinstance(payload, dict):
+                for k in keys:
+                    if k in payload:
+                        return payload.get(k, default)
+            return default
 
         # ---- MESSAGE LOOP ----
         while server_running:
@@ -315,34 +330,72 @@ def handle_client(sock: socket.socket):
                 })
 
             elif t == TYPE_PRIVATE_MSG:
-                target = m.get("to") or m["payload"].get("to")
+                target = _pget(m, "to")
+                ctb64 = _pget(m, "ciphertext_b64")
+                ctr = _pget(m, "ctr")
+
+                if not target or not ctb64 or ctr is None:
+                    peer.send_error("Malformed PRIVATE_MSG (missing to/ciphertext_b64/ctr)")
+                    continue
+
+                try:
+                    ctr_i = int(ctr)
+                    if ctr_i <= 0:
+                        raise ValueError("ctr must be > 0")
+                except Exception:
+                    peer.send_error("Malformed PRIVATE_MSG (ctr must be positive int)")
+                    continue
+
                 cs = find_socket_by_name(target)
                 if cs:
-                    ProtoPeer(cs).forward_private(
-                        name,
-                        m["payload"]["ciphertext_b64"],
-                        m["payload"]["ctr"]
-                    )
+                    ProtoPeer(cs).forward_private(name, ctb64, ctr_i)
                 else:
                     peer.send_error("User offline")
 
             elif t == TYPE_DIRECT_MSG:
-                target = m.get("to") or m["payload"].get("to")
+                target = _pget(m, "to")
+                text = _pget(m, "text", default="")
+
+                if not target:
+                    peer.send_error("Malformed DIRECT_MSG (missing to)")
+                    continue
+
                 cs = find_socket_by_name(target)
                 if cs:
-                    ProtoPeer(cs).forward_direct(name, m["payload"].get("text", ""))
+                    ProtoPeer(cs).forward_direct(name, str(text))
                 else:
                     peer.send_error("User offline")
 
             elif t == TYPE_SESSION_OFFER:
-                cs = find_socket_by_name(m.get("to"))
+                target = _pget(m, "to")
+                session_id = _pget(m, "session_id")
+                encrypted_key_b64 = _pget(m, "encrypted_key_b64")
+                sig_b64 = _pget(m, "sig_b64")
+
+                if not target or not session_id or not encrypted_key_b64 or not sig_b64:
+                    peer.send_error("Malformed SESSION_OFFER (missing fields)")
+                    continue
+
+                cs = find_socket_by_name(target)
                 if cs:
-                    ProtoPeer(cs).forward_session_offer(name, **m["payload"])
+                    ProtoPeer(cs).forward_session_offer(name, session_id, encrypted_key_b64, sig_b64)
+                else:
+                    peer.send_error("User offline")
 
             elif t == TYPE_SESSION_ACK:
-                cs = find_socket_by_name(m.get("to"))
+                target = _pget(m, "to")
+                session_id = _pget(m, "session_id")
+                confirm_hex = _pget(m, "confirm_hex")
+
+                if not target or not session_id or not confirm_hex:
+                    peer.send_error("Malformed SESSION_ACK (missing fields)")
+                    continue
+
+                cs = find_socket_by_name(target)
                 if cs:
-                    ProtoPeer(cs).forward_session_ack(name, **m["payload"])
+                    ProtoPeer(cs).forward_session_ack(name, session_id, confirm_hex)
+                else:
+                    peer.send_error("User offline")
 
             else:
                 peer.send_error("Unsupported type")
