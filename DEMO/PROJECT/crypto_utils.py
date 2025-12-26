@@ -38,13 +38,13 @@ def rsa_decrypt(encrypted_data: bytes, private_key_obj) -> bytes:
         ),
     )
 
-def build_session_offer_sig_bytes(sender: str, receiver: str, session_id: str, encrypted_key_b64: str) -> bytes:
+def build_session_offer_sig_bytes(sender: str, receiver: str, session_id: str, encrypted_key_b64: str, ts: int) -> bytes:
     """
     Canonical bytes to sign for SESSION_OFFER authentication.
     Keep this stable across versions.
     """
-    # Use a strict delimiter + UTF-8, do NOT pretty-print JSON (avoid ambiguity)
-    msg = f"{sender}|{receiver}|{session_id}|{encrypted_key_b64}"
+    # v2 includes ts to bind offer timestamp into signature
+    msg = f"{sender}|{receiver}|{session_id}|{encrypted_key_b64}|{int(ts)}|SESSION_OFFER|v2"
     return msg.encode("utf-8")
 
 def rsa_sign_pss_sha256(private_key, data: bytes) -> bytes:
@@ -70,7 +70,10 @@ def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode("utf-8")
 
 def b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("utf-8"))
+    if not isinstance(s, str) or not s:
+        raise ValueError("b64d expects a non-empty base64 string")
+    # validate=True: reject non-base64 characters
+    return base64.b64decode(s.encode("utf-8"), validate=True)
 
 # ---------------- AES-GCM helpers ----------------
 
@@ -78,26 +81,35 @@ def generate_aes_key() -> bytes:
     """Generate 256-bit AES-GCM key."""
     return AESGCM.generate_key(bit_length=256)
 
-
 def aes_encrypt(data_bytes: bytes, key: bytes, associated_data: Optional[bytes] = None) -> bytes:
+    if not isinstance(data_bytes, (bytes, bytearray)):
+        raise TypeError("data_bytes must be bytes")
+    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
+        raise TypeError("associated_data must be bytes or None")
+
     nonce = os.urandom(12)  # 96-bit nonce recommended for GCM
     aesgcm = AESGCM(key)
-    ct = aesgcm.encrypt(nonce, data_bytes, associated_data)
+    ct = aesgcm.encrypt(nonce, bytes(data_bytes), bytes(associated_data) if associated_data is not None else None)
     return nonce + ct
 
 def aes_decrypt(encrypted_data: bytes, key: bytes, associated_data: Optional[bytes] = None) -> Optional[bytes]:
-    if not encrypted_data or len(encrypted_data) < 13:
+    if not isinstance(encrypted_data, (bytes, bytearray)):
         return None
+    if associated_data is not None and not isinstance(associated_data, (bytes, bytearray)):
+        return None
+
+    # nonce(12) + ciphertext+tag(at least 16 tag bytes)
+    if len(encrypted_data) < 12 + 16:
+        return None
+
     nonce = encrypted_data[:12]
     ct = encrypted_data[12:]
     try:
         aesgcm = AESGCM(key)
-        return aesgcm.decrypt(nonce, ct, associated_data)
+        return aesgcm.decrypt(nonce, ct, bytes(associated_data) if associated_data is not None else None)
     except Exception:
-        # treat as tampered / wrong key
         return None
-
-
+    
 # ---------------- Key storage ----------------
 
 def generate_or_load_keys(name: str, password: str):

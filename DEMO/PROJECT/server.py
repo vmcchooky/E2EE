@@ -45,12 +45,20 @@ AUTH_WINDOW_SEC = 60
 AUTH_MAX_FAILS = 8
 AUTH_LOCK_SEC = 30
 
+# Rate limit (per-connection)
+MSG_WINDOW_SEC = 2.0
+MSG_MAX_IN_WINDOW = 40          # tune: 20-60 tùy demo
+MAX_TEXT_LEN = 2000
+MAX_B64_LEN = 64_000            # ciphertext cap
+MAX_PUBKEY_B64_LEN = 16_000     # pubkey cap
+
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
 server_running = True
 
+user_db_lock = threading.Lock()
 clients_data: dict[socket.socket, dict] = {}
 clients_lock = threading.Lock()
 
@@ -200,24 +208,36 @@ def broadcast(msg: dict):
             dead.append(s)
 
     if dead:
+        offline_names: list[str] = []
         with clients_lock:
             for s in dead:
-                clients_data.pop(s, None)
+                info = clients_data.pop(s, None)
+                if info and "name" in info:
+                    offline_names.append(info["name"])
                 try:
                     s.close()
                 except Exception:
                     pass
 
+        # announce offline for those who silently died
+        now_ts = int(time.time())
+        for n in offline_names:
+            try:
+                broadcast({"type": TYPE_USER_ANNOUNCE, "payload": {"name": n, "pubkey_b64": None, "ts": now_ts}})
+            except Exception:
+                pass
 
 def send_existing_users(to_sock: socket.socket):
     peer = ProtoPeer(to_sock)
     with clients_lock:
         users = list(clients_data.values())
 
+    now = int(time.time())
     for info in users:
         peer.send_user_announce(
             info["name"],
-            base64.b64encode(info["pubkey"]).decode()
+            base64.b64encode(info["pubkey"]).decode(),
+            now
         )
 
 # ============================================================
@@ -258,25 +278,55 @@ def handle_client(sock: socket.socket):
             peer.send_error("Empty password")
             return
 
+        # Lockout key: ip:name
         key = auth_key(name, sock)
         wait = auth_check_locked(key)
         if wait > 0:
             peer.send_error(f"Locked {wait}s")
             return
 
-        stored = user_db.get(name)
+        # 1) Snapshot stored record under user_db_lock (DO NOT verify under lock)
+        with user_db_lock:
+            stored = user_db.get(name)
+
         if stored is None:
-            user_db[name] = hash_password(password)
-            save_user_db()
+            # 2) Register new user (write path under lock)
+            new_rec = hash_password(password)
+            with user_db_lock:
+                # Re-check to avoid race: two clients register same name concurrently
+                if user_db.get(name) is None:
+                    user_db[name] = new_rec
+                    save_user_db()
+                else:
+                    stored = user_db.get(name)
+
+            # If stored was filled by another thread in the race, verify against it
+            if stored is not None:
+                ok, legacy = verify_password(password, stored)
+                if not ok:
+                    lock = auth_on_fail(key)
+                    peer.send_error("Auth failed" if lock == 0 else f"Locked {lock}s")
+                    return
+                if legacy:
+                    upgraded = hash_password(password)
+                    with user_db_lock:
+                        user_db[name] = upgraded
+                        save_user_db()
         else:
+            # 3) Existing user: verify outside lock
             ok, legacy = verify_password(password, stored)
             if not ok:
                 lock = auth_on_fail(key)
                 peer.send_error("Auth failed" if lock == 0 else f"Locked {lock}s")
                 return
+
+            # 4) Upgrade legacy SHA256 record to PBKDF2 (write under lock)
             if legacy:
-                user_db[name] = hash_password(password)
-                save_user_db()
+                upgraded = hash_password(password)
+                with user_db_lock:
+                    # Optional: ensure it hasn't changed; but overwrite is acceptable here
+                    user_db[name] = upgraded
+                    save_user_db()
 
         auth_on_success(key)
         peer.send({"type": TYPE_AUTH_OK, "payload": {}})
@@ -285,11 +335,19 @@ def handle_client(sock: socket.socket):
         peer.send({"type": TYPE_PUBKEY_REQ, "payload": {}})
         m = peer.recv()
         pub_b64 = m.get("payload", {}).get("pubkey_b64")
-        if not pub_b64:
-            peer.send_error("Missing pubkey")
+        if not pub_b64 or not isinstance(pub_b64, str) or len(pub_b64) > MAX_PUBKEY_B64_LEN:
+            peer.send_error("Missing/invalid pubkey")
             return
 
-        pubkey = base64.b64decode(pub_b64)
+        try:
+            pubkey = base64.b64decode(pub_b64, validate=True)
+        except Exception:
+            peer.send_error("Invalid pubkey_b64")
+            return
+
+        if len(pubkey) < 64 or len(pubkey) > 8192:
+            peer.send_error("Invalid pubkey size")
+            return
 
         with clients_lock:
             clients_data[sock] = {"name": name, "pubkey": pubkey}
@@ -297,7 +355,7 @@ def handle_client(sock: socket.socket):
         send_existing_users(sock)
         broadcast({
             "type": TYPE_USER_ANNOUNCE,
-            "payload": {"name": name, "pubkey_b64": pub_b64}
+            "payload": {"name": name, "pubkey_b64": pub_b64, "ts": int(time.time())}
         })
         
         # ---- HELPERS ----
@@ -314,28 +372,64 @@ def handle_client(sock: socket.socket):
                     if k in payload:
                         return payload.get(k, default)
             return default
+        
+        # ---- RATE LIMIT HELPERS ----
+        msg_times: list[float] = []
+
+        def rate_limit_hit() -> bool:
+            now = time.time()
+            # keep only within window
+            while msg_times and (now - msg_times[0] > MSG_WINDOW_SEC):
+                msg_times.pop(0)
+            msg_times.append(now)
+            return len(msg_times) > MSG_MAX_IN_WINDOW
+        
+        def b64_is_valid(s: str, max_len: int) -> bool:
+            if not isinstance(s, str) or not s or len(s) > max_len:
+                return False
+            try:
+                base64.b64decode(s, validate=True)
+                return True
+            except Exception:
+                return False
 
         # ---- MESSAGE LOOP ----
         while server_running:
             m = peer.recv()
+            if rate_limit_hit():
+                peer.send_error("Rate limit exceeded")
+                continue
+
             t = m.get("type")
 
             if t == TYPE_BROADCAST:
-                broadcast({
-                    "type": TYPE_BROADCAST,
-                    "payload": {
-                        "from": name,
-                        "text": m["payload"].get("text", "")
-                    }
-                })
+                text = _pget(m, "text", default="")
+                if not isinstance(text, str):
+                    peer.send_error("Malformed BROADCAST (text must be string)")
+                    continue
+                if len(text) > MAX_TEXT_LEN:
+                    peer.send_error("BROADCAST too long")
+                    continue
+
+                broadcast({"type": TYPE_BROADCAST, "payload": {"from": name, "text": text}})
 
             elif t == TYPE_PRIVATE_MSG:
                 target = _pget(m, "to")
                 ctb64 = _pget(m, "ciphertext_b64")
                 ctr = _pget(m, "ctr")
+                msg_id = _pget(m, "msg_id")
+                ts = _pget(m, "ts")
 
-                if not target or not ctb64 or ctr is None:
-                    peer.send_error("Malformed PRIVATE_MSG (missing to/ciphertext_b64/ctr)")
+                if not target or not ctb64 or ctr is None or not msg_id or ts is None:
+                    peer.send_error("Malformed PRIVATE_MSG (missing to/ciphertext_b64/ctr/msg_id/ts)")
+                    continue
+
+                if not b64_is_valid(ctb64, MAX_B64_LEN):
+                    peer.send_error("Malformed PRIVATE_MSG (ciphertext_b64 invalid/too large)")
+                    continue
+
+                if not isinstance(msg_id, str) or len(msg_id) > 128:
+                    peer.send_error("Malformed PRIVATE_MSG (msg_id invalid)")
                     continue
 
                 try:
@@ -346,15 +440,27 @@ def handle_client(sock: socket.socket):
                     peer.send_error("Malformed PRIVATE_MSG (ctr must be positive int)")
                     continue
 
+                try:
+                    ts_i = int(ts)
+                except Exception:
+                    peer.send_error("Malformed PRIVATE_MSG (ts must be int)")
+                    continue
+
                 cs = find_socket_by_name(target)
                 if cs:
-                    ProtoPeer(cs).forward_private(name, ctb64, ctr_i)
+                    ProtoPeer(cs).forward_private(name, ctb64, ctr_i, str(msg_id), ts_i)
                 else:
                     peer.send_error("User offline")
 
             elif t == TYPE_DIRECT_MSG:
                 target = _pget(m, "to")
                 text = _pget(m, "text", default="")
+                if not isinstance(text, str):
+                    peer.send_error("Malformed DIRECT_MSG (text must be string)")
+                    continue
+                if len(text) > MAX_TEXT_LEN:
+                    peer.send_error("DIRECT_MSG too long")
+                    continue
 
                 if not target:
                     peer.send_error("Malformed DIRECT_MSG (missing to)")
@@ -371,14 +477,30 @@ def handle_client(sock: socket.socket):
                 session_id = _pget(m, "session_id")
                 encrypted_key_b64 = _pget(m, "encrypted_key_b64")
                 sig_b64 = _pget(m, "sig_b64")
+                ts = _pget(m, "ts")
+                if ts is None:
+                    peer.send_error("Malformed SESSION_OFFER (missing ts)")
+                    continue
 
                 if not target or not session_id or not encrypted_key_b64 or not sig_b64:
                     peer.send_error("Malformed SESSION_OFFER (missing fields)")
                     continue
+                
+                if not b64_is_valid(encrypted_key_b64, MAX_B64_LEN):
+                    peer.send_error("Malformed SESSION_OFFER (encrypted_key_b64 invalid/too large)")
+                    continue
+
+                if not b64_is_valid(sig_b64, 8_000):
+                    peer.send_error("Malformed SESSION_OFFER (sig_b64 invalid/too large)")
+                    continue
+
+                if not isinstance(session_id, str) or len(session_id) > 128:
+                    peer.send_error("Malformed SESSION_OFFER (session_id invalid)")
+                    continue
 
                 cs = find_socket_by_name(target)
                 if cs:
-                    ProtoPeer(cs).forward_session_offer(name, session_id, encrypted_key_b64, sig_b64)
+                    ProtoPeer(cs).forward_session_offer(name, session_id, encrypted_key_b64, sig_b64, int(ts))
                 else:
                     peer.send_error("User offline")
 
@@ -409,7 +531,7 @@ def handle_client(sock: socket.socket):
             with clients_lock:
                 clients_data.pop(sock, None)
             try:
-                broadcast({"type": TYPE_USER_ANNOUNCE, "payload": {"name": name, "pubkey_b64": None}})
+                broadcast({"type": TYPE_USER_ANNOUNCE, "payload": {"name": name, "pubkey_b64": None, "ts": int(time.time())}})
             except Exception:
                 pass
         else:
@@ -435,7 +557,6 @@ def command_input():
             server_running = False
             break
 
-
 def start_server():
     global server_socket
     global server_running
@@ -445,6 +566,14 @@ def start_server():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(TLS_CERTFILE, TLS_KEYFILE)
+    
+    # Harden TLS context
+    ctx.options |= ssl.OP_NO_COMPRESSION
+    # Prefer modern ciphersuites (OpenSSL dependent)
+    try:
+        ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!eNULL:!MD5:!RC4:!3DES")
+    except Exception:
+        pass
 
     server_socket = socket.socket()
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -464,12 +593,22 @@ def start_server():
             except OSError:
                 break
 
-            sock = ctx.wrap_socket(raw, server_side=True)
-            threading.Thread(
-                target=handle_client,
-                args=(sock,),
-                daemon=True
-            ).start()
+            try:
+                sock = ctx.wrap_socket(raw, server_side=True)
+            except ssl.SSLError:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+                continue
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+                continue
+
+            threading.Thread(target=handle_client, args=(sock,), daemon=True).start()
 
     except KeyboardInterrupt:
         print("\n[SERVER] Ctrl+C received.")

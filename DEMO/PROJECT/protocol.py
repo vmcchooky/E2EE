@@ -4,8 +4,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 # 4-byte big-endian length prefix
 _LEN_STRUCT = struct.Struct("!I")
@@ -46,6 +45,12 @@ def recv_msg(sock: socket.socket) -> Dict[str, Any]:
         raise ProtoError(f"Invalid JSON: {e}") from e
     if not isinstance(msg, dict) or "type" not in msg:
         raise ProtoError("Invalid message format (missing type)")
+    payload = msg.get("payload", {})
+    if payload is None:
+        msg["payload"] = {}
+    elif not isinstance(payload, dict):
+        raise ProtoError("Invalid message format (payload must be an object)")
+
     return msg
 
 
@@ -82,7 +87,7 @@ def m_pubkey(pubkey_b64: str) -> Dict[str, Any]:
 def m_broadcast(text: str) -> Dict[str, Any]:
     return {"type": TYPE_BROADCAST, "payload": {"text": text}}
 
-def m_session_offer(to: str, session_id: str, encrypted_key_b64: str, sig_b64: str) -> Dict[str, Any]:
+def m_session_offer(to: str, session_id: str, encrypted_key_b64: str, sig_b64: str, ts: int) -> Dict[str, Any]:
     return {
         "type": TYPE_SESSION_OFFER,
         "to": to,
@@ -90,11 +95,9 @@ def m_session_offer(to: str, session_id: str, encrypted_key_b64: str, sig_b64: s
             "session_id": session_id,
             "encrypted_key_b64": encrypted_key_b64,
             "sig_b64": sig_b64,
+            "ts": int(ts),
         },
     }
-
-
-
 
 def m_session_ack(to: str, session_id: str, confirm_hex: str) -> Dict[str, Any]:
     return {
@@ -103,19 +106,26 @@ def m_session_ack(to: str, session_id: str, confirm_hex: str) -> Dict[str, Any]:
         "payload": {"session_id": session_id, "confirm_hex": confirm_hex},
     }
 
-def m_private_msg(to: str, ciphertext_b64: str, ctr: int) -> Dict[str, Any]:
+def m_private_msg(to: str, ciphertext_b64: str, ctr: int, msg_id: str, ts: int) -> Dict[str, Any]:
     return {
         "type": TYPE_PRIVATE_MSG,
         "to": to,
         "payload": {
             "ciphertext_b64": ciphertext_b64,
             "ctr": int(ctr),
+            "msg_id": str(msg_id),
+            "ts": int(ts),
         },
     }
+    
+def m_error(message: str, reason: str | None = None) -> Dict[str, Any]:
+    return {"type": TYPE_ERROR, "payload": {"message": message, "reason": reason or message}}
 
-# You can add more helper functions for other message types as needed
-# End of protocol.py
-
+def m_user_announce(name: str, pubkey_b64: str | None, ts: int | None = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"name": name, "pubkey_b64": pubkey_b64}
+    if ts is not None:
+        payload["ts"] = int(ts)
+    return {"type": TYPE_USER_ANNOUNCE, "payload": payload}
 
 def m_direct_msg(to: str, text: str) -> Dict[str, Any]:
     return {

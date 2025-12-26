@@ -21,21 +21,27 @@ class ProtoPeer:
         self.sock = sock
 
     def recv(self) -> dict:
-        return recv_msg(self.sock)
+        m = recv_msg(self.sock)
+        p = m.get("payload", {})
+        if p is None:
+            m["payload"] = {}
+        elif not isinstance(p, dict):
+            raise ValueError("Invalid payload (must be object)")
+        return m
 
     def send(self, msg: dict) -> None:
         send_msg(self.sock, msg)
 
-    def send_error(self, reason: str) -> None:
-        self.send({"type": TYPE_ERROR, "payload": {"message": reason, "reason": reason}})
+    def send_error(self, message: str, reason: str | None = None) -> None:
+        self.send({"type": TYPE_ERROR, "payload": {"message": message, "reason": reason or message}})
 
-    def send_user_announce(self, name: str, pubkey_b64: str | None) -> None:
-        self.send({"type": TYPE_USER_ANNOUNCE, "payload": {"name": name, "pubkey_b64": pubkey_b64}})
+    def send_user_announce(self, name: str, pubkey_b64: str | None, ts: int) -> None:
+        self.send({"type": TYPE_USER_ANNOUNCE, "payload": {"name": name, "pubkey_b64": pubkey_b64, "ts": int(ts)}})
 
     def send_broadcast_from(self, sender: str, text: str) -> None:
         self.send({"type": TYPE_BROADCAST, "payload": {"from": sender, "text": text}})
 
-    def forward_private(self, sender: str, ciphertext_b64: str, ctr: int) -> None:
+    def forward_private(self, sender: str, ciphertext_b64: str, ctr: int, msg_id: str, ts: int) -> None:
         self.send(
             {
                 "type": TYPE_PRIVATE_MSG,
@@ -43,6 +49,8 @@ class ProtoPeer:
                     "from": sender,
                     "ciphertext_b64": ciphertext_b64,
                     "ctr": int(ctr),
+                    "msg_id": str(msg_id),
+                    "ts": int(ts),
                 },
             }
         )
@@ -58,7 +66,7 @@ class ProtoPeer:
             }
         )
 
-    def forward_session_offer(self, sender: str, session_id: str, encrypted_key_b64: str, sig_b64: str) -> None:
+    def forward_session_offer(self, sender: str, session_id: str, encrypted_key_b64: str, sig_b64: str, ts: int) -> None:
         self.send(
             {
                 "type": TYPE_SESSION_OFFER,
@@ -67,6 +75,7 @@ class ProtoPeer:
                     "session_id": session_id,
                     "encrypted_key_b64": encrypted_key_b64,
                     "sig_b64": sig_b64,
+                    "ts": int(ts),
                 },
             }
         )
