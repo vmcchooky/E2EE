@@ -34,9 +34,10 @@ venv/
 # Ignore PEM files (private keys, certificates)
 *.pem
 
-# Exception: Allow certs directory and files within it
+# Exception: Allow certs directory and specific files within it
 !certs/
-!certs/**
+!certs/server_cert.pem
+!certs/server_key.pem
 
 # Ignore JSON files (if any are generated)
 *.json
