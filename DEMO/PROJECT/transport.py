@@ -40,9 +40,9 @@ class ProtoClient:
         send_msg(self.sock, m_direct_msg(to, text))
 
     def send_session_offer(self, to: str, session_id: str, encrypted_key_b64: str, sig_b64: str, ts: int | None = None) -> None:
-            if ts is None:
-                ts = int(time.time())
-            send_msg(self.sock, m_session_offer(to, session_id, encrypted_key_b64, sig_b64, ts))
+        if ts is None:
+            ts = int(time.time())
+        send_msg(self.sock, m_session_offer(to, session_id, encrypted_key_b64, sig_b64, ts))
 
     def send_session_ack(self, to: str, session_id: str, confirm_hex: str) -> None:
         send_msg(self.sock, m_session_ack(to, session_id, confirm_hex))

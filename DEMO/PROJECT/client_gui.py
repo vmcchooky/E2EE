@@ -3,7 +3,7 @@ import threading
 import customtkinter as ctk
 import base64
 from datetime import datetime
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 from protocol import ProtoError
 
 import queue
@@ -30,6 +30,8 @@ from crypto_utils import (
     b64e,
     b64d,
 )
+from local_store import LocalMessageStore
+
 
 from protocol import (
     TYPE_NAME_REQ, TYPE_AUTH_REQ, TYPE_AUTH_OK, TYPE_ERROR, TYPE_PUBKEY_REQ,
@@ -80,7 +82,11 @@ class ChatApp(ctk.CTk):
         self.pending_key_changes = {}  # peer -> {old_fp,new_fp,pubkey_bytes}
         self.pending_notices = {}      # peer -> [system message dict]
         self.notice_flags = set()      # peers with pending notices
-        self.e2ee_enabled = {}         # peer -> bool (default False)
+        self.e2ee_enabled = {}
+        self.local_store = None
+        self._key_password = None
+        self._local_store_loaded_peers = set()
+         # peer -> bool (default False)
                 # {name: "TOFU"|"VERIFIED"|"CHANGED"}
 
         self.send_ctr = {}                  # {name: int}
@@ -280,11 +286,14 @@ class ChatApp(ctk.CTk):
         self.btn_rekey_side = ctk.CTkButton(self.info_more, text="Re-key", command=self.rekey_current_session)
         self.btn_rekey_side.grid(row=0, column=0, padx=(0, 6), pady=8, sticky="ew")
 
-        self.btn_export = ctk.CTkButton(self.info_more, text="Export (Soon)", command=lambda: self.log_status("Export: chưa triển khai", level="INFO"))
+        self.btn_export = ctk.CTkButton(self.info_more, text="Export (Soon)", command=self.export_local_store)
         self.btn_export.grid(row=0, column=1, padx=(6, 0), pady=8, sticky="ew")
+        
+        self.btn_import = ctk.CTkButton(self.info_more, text="Import", command=self.import_local_store)
+        self.btn_import.grid(row=1, column=0, columnspan=2, padx=0, pady=(0, 8), sticky="ew")
 
         self.switch_e2ee = ctk.CTkSwitch(self.info_more, text="E2EE (this chat)", command=self.on_toggle_e2ee)
-        self.switch_e2ee.grid(row=1, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
+        self.switch_e2ee.grid(row=2, column=0, columnspan=2, padx=6, pady=(0, 8), sticky="w")
         self.switch_e2ee.deselect()
 
         # ---- Security tab (self-check dashboard) ----
@@ -522,35 +531,84 @@ class ChatApp(ctk.CTk):
         self._queue_security_notice(peer, text)
 
     def _enqueue_outgoing_private(self, peer: str, text: str) -> None:
-        """Queue outbound plaintext while session not confirmed."""
-        if not peer or peer == "Broadcast":
-            return
-        q = self.pending_outgoing_private.setdefault(peer, [])
-        # cap to avoid unbounded growth
-        if len(q) >= 50:
-            q.pop(0)
-        q.append(text)
+        """Queue outbound plaintext while session not confirmed.
+
+        IMPORTANT: we persist queued messages to the local store so they are not lost
+        when the user toggles E2EE on/off or restarts the app.
+        """
+        try:
+            if not peer or peer == "Broadcast":
+                return
+
+            # Normalize queue storage to list[dict]
+            q = self.pending_outgoing_private.setdefault(peer, [])
+            if len(q) >= 50:
+                q.pop(0)
+
+            msg_id = uuid.uuid4().hex
+            ts = int(time.time())
+            item = {"id": msg_id, "ts": ts, "text": text}
+            q.append(item)
+
+            # Persist + show immediately
+            self._ensure_conversation_tile(peer)
+            self._store_local(peer, "out", text, e2ee=True, msg_id=msg_id, ts=ts, status="queued")
+            self.add_outgoing_message(peer, text, encrypted=True, msg_id=msg_id, ts_epoch=ts, status="queued")
+        except Exception as e:
+            self.log_status(f"Enqueue outgoing queue error for {peer}: {e}", level="ERROR")
 
     def _flush_outgoing_private(self, peer: str) -> None:
-        """Send any queued outbound messages once E2EE session is confirmed."""
+        """Send any queued outbound messages once E2EE session is confirmed.
+
+        We DO NOT drop the queue when E2EE is toggled OFF. Messages remain in local history
+        (status='queued') and can be sent later after E2EE is re-enabled and confirmed.
+        """
         try:
             if not peer or peer == "Broadcast":
                 return
             if not self.e2ee_enabled.get(peer, False):
-                # If user turned E2EE off, drop queued encrypted messages (they were intended for E2EE)
-                self.pending_outgoing_private.pop(peer, None)
                 return
             if not self.session_confirmed.get(peer, False):
                 return
+
             q = self.pending_outgoing_private.get(peer) or []
             if not q:
                 return
-            # flush in FIFO
-            while q:
-                msg = q.pop(0)
-                self._send_private_encrypted(peer, msg)
-            # cleanup
-            self.pending_outgoing_private.pop(peer, None)
+
+            # Convert legacy queue (list[str]) to new format (list[dict])
+            normalized = []
+            for it in list(q):
+                if isinstance(it, dict) and "text" in it:
+                    normalized.append(it)
+                else:
+                    # Legacy (string) - persist now so it isn't lost
+                    mid = uuid.uuid4().hex
+                    ts = int(time.time())
+                    txt = str(it)
+                    normalized.append({"id": mid, "ts": ts, "text": txt})
+                    self._store_local(peer, "out", txt, e2ee=True, msg_id=mid, ts=ts, status="queued")
+                    self.add_outgoing_message(peer, txt, encrypted=True, msg_id=mid, ts_epoch=ts, status="queued")
+
+            # Flush in FIFO, keep unsent items if an error occurs
+            new_queue = []
+            for item in normalized:
+                try:
+                    self._send_private_encrypted(
+                        peer,
+                        item.get("text", ""),
+                        msg_id=item.get("id"),
+                        ts=item.get("ts"),
+                        pre_saved=True,
+                    )
+                except Exception as e:
+                    # Keep for later retry
+                    new_queue.append(item)
+                    self.log_status(f"Flush outgoing PRIVATE_MSG failed for {peer}: {e}", level="ERROR")
+
+            if new_queue:
+                self.pending_outgoing_private[peer] = new_queue
+            else:
+                self.pending_outgoing_private.pop(peer, None)
         except Exception as e:
             self.log_status(f"Flush outgoing queue error for {peer}: {e}", level="ERROR")
 
@@ -586,7 +644,10 @@ class ChatApp(ctk.CTk):
             self.log_status(f"Flush incoming buffer error for {peer}: {e}", level="ERROR")
 
     def _process_private_msg_payload(self, payload: Dict[str, Any], *, buffered: bool = False) -> None:
-        """Core PRIVATE_MSG processing. `payload` is the message payload dict (not the outer frame)."""
+        """Core PRIVATE_MSG processing. `payload` is the message payload dict (not the outer frame).
+
+        Fix: persist inbound E2EE messages to local store (previously missing).
+        """
         sender_name = payload.get("from")
         ciphertext_b64 = payload.get("ciphertext_b64")
         ctr_raw = payload.get("ctr")
@@ -594,9 +655,11 @@ class ChatApp(ctk.CTk):
         ts_raw = payload.get("ts")
 
         if not sender_name or not ciphertext_b64 or ctr_raw is None or not msg_id or ts_raw is None:
-            self._rate_limited_notice(sender_name or "Unknown",
+            self._rate_limited_notice(
+                sender_name or "Unknown",
                 "[SECURITY] PRIVATE_MSG thiếu field bắt buộc (from/ciphertext_b64/ctr/msg_id/ts).",
-                min_interval_sec=2.0)
+                min_interval_sec=2.0,
+            )
             return
 
         # ctr validation
@@ -605,100 +668,147 @@ class ChatApp(ctk.CTk):
             if ctr <= 0:
                 raise ValueError("ctr must be > 0")
         except Exception:
-            self._rate_limited_notice(sender_name,
+            self._rate_limited_notice(
+                sender_name,
                 f"[SECURITY] ctr không hợp lệ: {ctr_raw!r}. Tin nhắn bị bỏ qua.",
-                min_interval_sec=2.0)
+                min_interval_sec=2.0,
+            )
             return
 
         # ts must be int
         try:
             ts = int(ts_raw)
         except Exception:
-            self._rate_limited_notice(sender_name,
+            self._rate_limited_notice(
+                sender_name,
                 f"[SECURITY] ts không hợp lệ: {ts_raw!r}. Tin nhắn bị bỏ qua.",
-                min_interval_sec=2.0)
+                min_interval_sec=2.0,
+            )
             return
 
         last = int(self.recv_ctr.get(sender_name, 0))
         if ctr <= last:
-            self._rate_limited_notice(sender_name,
+            self._rate_limited_notice(
+                sender_name,
                 f"[SECURITY] Replay/Out-of-order: ctr={ctr} <= last={last}. Tin nhắn bị bỏ qua.",
-                min_interval_sec=1.5)
+                min_interval_sec=1.5,
+            )
             return
 
         # If session not confirmed yet, buffer instead of dropping (prevents "lost messages")
         if not self.session_confirmed.get(sender_name, False):
             self._buffer_incoming_private(sender_name, payload)
-            # warn at most once every few seconds per peer
-            self._rate_limited_notice(sender_name,
+            self._rate_limited_notice(
+                sender_name,
                 "[SYSTEM] Đang đàm phán E2EE… Tin nhắn sẽ được xử lý sau khi phiên được xác nhận.",
-                min_interval_sec=5.0)
+                min_interval_sec=5.0,
+            )
             return
 
         session_key = self.session_keys.get(sender_name)
         if not session_key:
-            # If confirmed but no key, treat as inconsistent state
-            self._rate_limited_notice(sender_name,
+            self._rate_limited_notice(
+                sender_name,
                 "[SECURITY] Nhận PRIVATE_MSG nhưng chưa có session key. Tin nhắn bị bỏ qua.",
-                min_interval_sec=3.0)
+                min_interval_sec=3.0,
+            )
             return
 
         # base64 decode harden
         try:
             encrypted_bytes = base64.b64decode(ciphertext_b64, validate=True)
         except Exception:
-            self._rate_limited_notice(sender_name,
+            self._rate_limited_notice(
+                sender_name,
                 "[SECURITY] ciphertext_b64 không hợp lệ (base64 decode fail). Tin nhắn bị bỏ qua.",
-                min_interval_sec=2.0)
+                min_interval_sec=2.0,
+            )
             return
 
         aad = f"{sender_name}|{self.username}|{ctr}|{ts}|{msg_id}".encode("utf-8")
         decrypted = aes_decrypt(encrypted_bytes, session_key, associated_data=aad)
         if decrypted is None:
-            self._rate_limited_notice(sender_name,
+            self._rate_limited_notice(
+                sender_name,
                 f"[SECURITY] Không thể giải mã (ctr={ctr}, msg_id={msg_id}). Có thể lệch khóa hoặc bị sửa đổi.",
-                min_interval_sec=2.0)
+                min_interval_sec=2.0,
+            )
             return
 
         self.recv_ctr[sender_name] = ctr
         self.in_msg_count[sender_name] = self.in_msg_count.get(sender_name, 0) + 1
         safe_text = decrypted.decode("utf-8", errors="replace")
-        self.add_incoming_message(sender_name, safe_text, encrypted=True)
 
-    def _send_private_encrypted(self, target: str, msg: str) -> None:
-        """Encrypt+send one PRIVATE_MSG. Assumes session is confirmed."""
+        # Persist + UI
+        self._ensure_conversation_tile(sender_name)
+        self._store_local(sender_name, "in", safe_text, e2ee=True, msg_id=msg_id, ts=ts, status="recv")
+        self.add_incoming_message(sender_name, safe_text, encrypted=True, msg_id=msg_id, ts_epoch=ts, status="recv")
+
+    def _send_private_encrypted(
+        self,
+        target: str,
+        msg: str,
+        *,
+        msg_id: Optional[str] = None,
+        ts: Optional[int] = None,
+        pre_saved: bool = False,
+    ) -> None:
+        """Encrypt+send one PRIVATE_MSG (E2EE).
+
+        Fixes:
+        - Persist outgoing E2EE messages to local store (previously missing).
+        - If send fails, message remains stored with status='queued' and can be retried later.
+        - If called before session confirmed, we queue+persist instead of dropping.
+        """
         if not target or target == "Broadcast":
             return
+
         if not self.session_confirmed.get(target, False):
-            # If called unexpectedly, queue instead of dropping
             self._enqueue_outgoing_private(target, msg)
             return
+
         aes_key = self.session_keys.get(target)
         if not aes_key:
-            self._rate_limited_notice(target, "[SECURITY] Không thể gửi PRIVATE_MSG: chưa có session key.", min_interval_sec=2.0)
+            self._rate_limited_notice(
+                target,
+                "[SECURITY] Không thể gửi PRIVATE_MSG: chưa có session key.",
+                min_interval_sec=2.0,
+            )
             self._enqueue_outgoing_private(target, msg)
             return
 
-        ctr = self.send_ctr.get(target, 0) + 1
+        mid = msg_id or uuid.uuid4().hex
+        ts_i = int(ts) if ts is not None else int(time.time())
+
+        # Persist + show once (if not already saved by the queue)
+        if not pre_saved:
+            self._ensure_conversation_tile(target)
+            self._store_local(target, "out", msg, e2ee=True, msg_id=mid, ts=ts_i, status="queued")
+            self.add_outgoing_message(target, msg, encrypted=True, msg_id=mid, ts_epoch=ts_i, status="queued")
+
+        # ctr + AAD
+        ctr = int(self.send_ctr.get(target, 0)) + 1
         self.send_ctr[target] = ctr
+        aad = f"{self.username}|{target}|{ctr}|{ts_i}|{mid}".encode("utf-8")
 
-        msg_id = uuid.uuid4().hex
-        ts = int(time.time())
-
-        aad = f"{self.username}|{target}|{ctr}|{ts}|{msg_id}".encode("utf-8")
-
-        encrypted_bytes = aes_encrypt(
-            msg.encode("utf-8"),
-            aes_key,
-            associated_data=aad,
-        )
+        encrypted_bytes = aes_encrypt(msg.encode("utf-8"), aes_key, associated_data=aad)
         encrypted_b64 = base64.b64encode(encrypted_bytes).decode("utf-8")
 
-        self.proto.send_private_msg(target, encrypted_b64, ctr, msg_id, ts)
-        self.add_outgoing_message(target, msg, encrypted=True)
+        try:
+            self.proto.send_private_msg(target, encrypted_b64, ctr, mid, ts_i)
+            # Mark sent
+            self._store_update_status(mid, "sent")
+        except Exception:
+            # Keep in queue for later retry
+            q = self.pending_outgoing_private.setdefault(target, [])
+            # Avoid duplicates by msg_id
+            if not any(isinstance(it, dict) and it.get("id") == mid for it in q):
+                q.append({"id": mid, "ts": ts_i, "text": msg})
+            raise
 
         self.out_msg_count[target] = self.out_msg_count.get(target, 0) + 1
         self.maybe_auto_rekey(target)
+
     def _pump_events(self) -> None:
         """Runs on UI thread; drains queued events and dispatches handlers."""
         try:
@@ -1096,6 +1206,7 @@ class ChatApp(ctk.CTk):
             self.out_msg_count.pop(peer, None)
             self.last_rekey_time.pop(peer, None)
             self.pending_key_changes.pop(peer, None)
+            self.ui(self._refresh_conversation_tile, peer)
             self._queue_security_notice(peer, f"[SECURITY] Bạn đã chấp nhận public key mới của {peer}.\n" "Phiên E2EE cũ đã bị hủy.\n" "Hãy xác minh fingerprint ngoài kênh để đánh dấu Verified.")
             self.update_right_panel()
             self.update_chat_header()
@@ -1315,10 +1426,8 @@ class ChatApp(ctk.CTk):
         else:
             _safe_cfg(w.get("badge"), text="")
             _safe_cfg(w.get("unread"), text="")
-
-        # Optional: trust indicator nếu bạn có gắn vào subtitle/title (tuỳ UI bạn)
-        # Ví dụ: nếu VERIFIED/CHANGED thì append vào subtitle
-        if trust:
+        # Optional: trust indicator (only for strong states)
+        if trust in ("VERIFIED", "CHANGED"):
             _safe_cfg(w.get("subtitle"), text=f"{sub_text} • {trust}")
 
         # Nếu bạn có highlight tile active, cũng bọc try/except
@@ -1421,18 +1530,61 @@ class ChatApp(ctk.CTk):
         # marshal về UI thread
         self.ui(self._append_message, conv, {"kind": "system", "text": text, "meta": ts}, False)
 
-    def add_incoming_message(self, sender: str, text: str, encrypted: bool = False, conv_id: Optional[str] = None):
+    def add_incoming_message(
+        self,
+        sender: str,
+        text: str,
+        encrypted: bool = False,
+        conv_id: Optional[str] = None,
+        *,
+        msg_id: Optional[str] = None,
+        ts_epoch: Optional[int] = None,
+        status: str = "recv",
+    ):
         conv = conv_id or sender
-        ts = datetime.now().strftime("%H:%M")
-        meta = f"{ts}" + (" • 🔒" if encrypted else "")
-        self._append_message(conv, {"kind": "chat", "direction": "in", "text": text, "meta": meta})
+        if ts_epoch is None:
+            ts_str = datetime.now().strftime("%H:%M")
+        else:
+            try:
+                ts_str = datetime.fromtimestamp(int(ts_epoch)).strftime("%H:%M")
+            except Exception:
+                ts_str = datetime.now().strftime("%H:%M")
 
-    def add_outgoing_message(self, target: str, text: str, encrypted: bool = False, conv_id: Optional[str] = None):
+        meta = f"{ts_str}" + (" • 🔒" if encrypted else "")
+        m: Dict[str, Any] = {"kind": "chat", "direction": "in", "text": text, "meta": meta, "status": status}
+        if msg_id:
+            m["id"] = msg_id
+        if ts_epoch is not None:
+            m["ts"] = int(ts_epoch)
+        self._append_message(conv, m)
+
+    def add_outgoing_message(
+        self,
+        target: str,
+        text: str,
+        encrypted: bool = False,
+        conv_id: Optional[str] = None,
+        *,
+        msg_id: Optional[str] = None,
+        ts_epoch: Optional[int] = None,
+        status: str = "sent",
+    ):
         conv = conv_id or target
-        ts = datetime.now().strftime("%H:%M")
-        meta = f"{ts}" + (" • 🔒" if encrypted else "")
-        self._append_message(conv, {"kind": "chat", "direction": "out", "text": text, "meta": meta},
-                            bump_unread_if_inactive=False)
+        if ts_epoch is None:
+            ts_str = datetime.now().strftime("%H:%M")
+        else:
+            try:
+                ts_str = datetime.fromtimestamp(int(ts_epoch)).strftime("%H:%M")
+            except Exception:
+                ts_str = datetime.now().strftime("%H:%M")
+
+        meta = f"{ts_str}" + (" • 🔒" if encrypted else "")
+        m: Dict[str, Any] = {"kind": "chat", "direction": "out", "text": text, "meta": meta, "status": status}
+        if msg_id:
+            m["id"] = msg_id
+        if ts_epoch is not None:
+            m["ts"] = int(ts_epoch)
+        self._append_message(conv, m, bump_unread_if_inactive=False)
 
     def ask_yesno_threadsafe(self, title: str, message: str) -> bool:
         """
@@ -1440,7 +1592,7 @@ class ChatApp(ctk.CTk):
         Thread receive sẽ chờ kết quả, UI không bị crash.
         """
         # import threading
-        # from tkinter import messagebox
+        # from tkinter import messagebox, filedialog
 
         event = threading.Event()
         result = {"value": False}
@@ -1639,6 +1791,17 @@ class ChatApp(ctk.CTk):
 
         self.username = name
         self.server_password = server_password
+        self._key_password = key_password
+
+        # Local message store (encrypted at-rest)
+        try:
+            self.local_store = LocalMessageStore(self.username)
+            self.local_store.unlock(key_password)
+        except Exception as e:
+            # Keep app usable even if local store fails
+            self.local_store = None
+            self.log_status(f"[WARN] Local store unavailable: {e}", level="WARN")
+
         self.title(f"Secure Chat - {self.username}")
 
         # 1. Logic tạo/nạp khóa RSA (có password)
@@ -1824,6 +1987,10 @@ class ChatApp(ctk.CTk):
                 if old_fp != fp:
                     # 1) Mark changed + store pending change
                     self.peer_trust[name] = "CHANGED"
+                    # If already pending, keep the original old_fp but update the latest candidate key
+                    existing = self.pending_key_changes.get(name)
+                    if existing:
+                        old_fp = existing.get("old_fp", old_fp)
                     self.pending_key_changes[name] = {
                         "old_fp": old_fp,
                         "new_fp": fp,
@@ -1832,7 +1999,7 @@ class ChatApp(ctk.CTk):
 
                     # 2) Purge crypto/session state BUT KEEP the notice we are about to queue
                     #    (otherwise notice gets deleted immediately)
-                    self._purge_peer_state(name, keep_notices=True)
+                    self._purge_peer_state(name, keep_notices=True, keep_key_change=True)
 
                     # 3) Force E2EE OFF for this peer globally (avoid auto-handshake on switch)
                     self.e2ee_enabled[name] = False
@@ -2035,22 +2202,20 @@ class ChatApp(ctk.CTk):
                         sender_name,
                         f"[SYSTEM] Đã re-key thành công (session_id={session_id[:8]}...)."
                     )
-
                 # Commit key mới + reset state (cực quan trọng cho re-key)
                 self.session_keys[sender_name] = key
                 self.session_confirmed[sender_name] = True
 
-                # Reset counters
-                # Flush any queued/buffered messages after ACK confirms the session
-                self._flush_incoming_private(sender_name)
-                self._flush_outgoing_private(sender_name)
-
-                # Reset counters để anti-replay đồng bộ với key mới
+                # Reset counters để anti-replay đồng bộ với key mới (phải reset TRƯỚC khi flush)
                 self.send_ctr[sender_name] = 0
                 self.recv_ctr[sender_name] = 0
                 self.out_msg_count[sender_name] = 0
                 self.last_rekey_time[sender_name] = time.time()
-                
+
+                # Flush any queued/buffered messages after ACK confirms the session
+                self._flush_incoming_private(sender_name)
+                self._flush_outgoing_private(sender_name)
+
                 # Clear handshake tracking
                 self.active_session_id.pop(sender_name, None)
                 self.pending_handshake_deadline.pop(sender_name, None)
@@ -2080,6 +2245,10 @@ class ChatApp(ctk.CTk):
                     return
                 # Ensure conversation and append
                 self._ensure_conversation_tile(sender_name)
+                # Local store (plaintext at-rest encryption)
+                _mid = uuid.uuid4().hex
+                _ts = int(time.time())
+                self._store_local(sender_name, "in", text, e2ee=False, msg_id=_mid, ts=_ts, status="recv")
                 self.add_incoming_message(sender_name, text, encrypted=False)
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý DIRECT_MSG: {e}")
@@ -2095,9 +2264,13 @@ class ChatApp(ctk.CTk):
                 # Broadcast conversation
                 self._ensure_conversation_tile("Broadcast", subtitle="Phòng chat chung", trust="")
                 if sender_name == self.username:
+                    # Some servers echo broadcast back to the sender; avoid double-persisting.
                     self.add_outgoing_message("Broadcast", text, encrypted=False, conv_id="Broadcast")
                 else:
-                    self.add_incoming_message(sender_name, text, encrypted=False, conv_id="Broadcast")
+                    mid = uuid.uuid4().hex
+                    ts = int(time.time())
+                    self._store_local("Broadcast", "in", text, e2ee=False, msg_id=mid, ts=ts, status="recv")
+                    self.add_incoming_message(sender_name, text, encrypted=False, conv_id="Broadcast", msg_id=mid, ts_epoch=ts, status="recv")
             except Exception as e:
                 self.display_message(f"[ERROR] Lỗi xử lý BROADCAST: {e}")
 
@@ -2106,53 +2279,82 @@ class ChatApp(ctk.CTk):
             
     def send_message_event(self):
         msg = self.entry_message.get()
-        if not msg: return
-        
+        if not msg:
+            return
+
         target = self.current_chat_partner
-        
+
+        # ---------------- Broadcast (always plaintext) ----------------
         if target == "Broadcast":
-            # Gửi tin nhắn công khai
             try:
+                self._ensure_conversation_tile("Broadcast", subtitle="Phòng chat chung", trust="")
+                mid = uuid.uuid4().hex
+                ts = int(time.time())
+
+                # Persist + show immediately (so it won't be lost if send fails)
+                self._store_local("Broadcast", "out", msg, e2ee=False, msg_id=mid, ts=ts, status="queued")
+                self.add_outgoing_message("Broadcast", msg, encrypted=False, conv_id="Broadcast", msg_id=mid, ts_epoch=ts, status="queued")
+
                 self.proto.send_broadcast(msg)
-                self.add_outgoing_message("Broadcast", msg, encrypted=False, conv_id="Broadcast")
+                self._store_update_status(mid, "sent")
             except Exception as e:  # noqa: BLE001
                 self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn broadcast: {e}")
-        else:
-            # Default: plaintext direct message unless E2EE is enabled for this chat
+
+            self.entry_message.delete(0, "end")
+            return
+
+        # ---------------- Direct (per-peer toggle) ----------------
+        try:
+            if not target:
+                return
+            self._ensure_conversation_tile(target)
+
+            # Plaintext mode
             if not self.e2ee_enabled.get(target, False):
+                mid = uuid.uuid4().hex
+                ts = int(time.time())
+
+                # Persist + show immediately
+                self._store_local(target, "out", msg, e2ee=False, msg_id=mid, ts=ts, status="queued")
+                self.add_outgoing_message(target, msg, encrypted=False, msg_id=mid, ts_epoch=ts, status="queued")
+
                 try:
                     self.proto.send_direct_msg(target, msg)
-                    self.add_outgoing_message(target, msg, encrypted=False)
+                    self._store_update_status(mid, "sent")
                 except Exception as e:
                     self.display_message(f"[ERROR] Lỗi khi gửi DIRECT_MSG: {e}")
-            else:
-                # If peer identity changed and not accepted, block E2EE until user accepts new key.
-                if target in self.pending_key_changes:
-                    self._queue_security_notice(
-                        target,
-                        "[SECURITY] Không thể bật E2EE vì identity của peer đã thay đổi. "
-                        "Vào tab Info để Accept New Key sau khi bạn xác minh fingerprint."
-                    )
-                elif not self.session_confirmed.get(target, False):
-                    # Queue outbound message instead of dropping it; flush after confirm
-                    self._enqueue_outgoing_private(target, msg)
-                    self._rate_limited_notice(
-                        target,
-                        "[SYSTEM] Đang thiết lập phiên E2EE… Tin nhắn sẽ được gửi sau khi phiên được xác nhận.",
-                        min_interval_sec=5.0
-                    )
-                    # Start handshake if not already in-flight
-                    if not self.pending_handshake_deadline.get(target):
-                        self.perform_handshake(target)
-                else:
-                    try:
-                        self._send_private_encrypted(target, msg)
-                    except Exception as e:
-                        self.display_message(f"[ERROR] Lỗi khi gửi PRIVATE_MSG: {e}")
+                return
 
-        self.entry_message.delete(0, "end")
-    
-    # [FIX] Sửa lại hàm thêm nút user
+            # E2EE mode (blocked if key changed)
+            if target in self.pending_key_changes:
+                # Still persist to history (queued) so user doesn't lose their text
+                self._enqueue_outgoing_private(target, msg)
+                self._queue_security_notice(
+                    target,
+                    "[SECURITY] Không thể bật E2EE vì identity của peer đã thay đổi. "
+                    "Vào tab Info để Accept New Key sau khi bạn xác minh fingerprint.",
+                )
+                return
+
+            if not self.session_confirmed.get(target, False):
+                # Queue outbound message; will be flushed once session is confirmed
+                self._enqueue_outgoing_private(target, msg)
+                self._rate_limited_notice(
+                    target,
+                    "[SYSTEM] Đang thiết lập phiên E2EE… Tin nhắn sẽ được gửi sau khi phiên được xác nhận.",
+                    min_interval_sec=5.0,
+                )
+                # Start handshake if not already in-flight
+                if not self.pending_handshake_deadline.get(target):
+                    self.perform_handshake(target)
+                return
+
+            # Session confirmed: send now (and persist inside _send_private_encrypted)
+            self._send_private_encrypted(target, msg)
+        except Exception as e:
+            self.display_message(f"[ERROR] Lỗi khi gửi tin nhắn: {e}")
+        finally:
+            self.entry_message.delete(0, "end")
 
     def add_user_button(self, name):
         # In modern UI, this creates/updates a conversation tile
@@ -2162,8 +2364,31 @@ class ChatApp(ctk.CTk):
         self._apply_search_filter()
 
     def select_chat_partner(self, name):
+        # Normalize in case caller/UI passes display text (e.g. "Peer: alice", "(3) alice ✅")
+        raw = (name or "").strip()
+
+        if raw.lower().startswith("peer:"):
+            raw = raw.split(":", 1)[1].strip()
+
+        # Strip leading unread prefix like "(3) alice"
+        if raw.startswith("(") and ")" in raw:
+            close = raw.find(")")
+            maybe_n = raw[1:close]
+            if maybe_n.isdigit():
+                raw = raw[close + 1 :].strip()
+
+        # Strip common decoration tokens if you ever add them to UI
+        for tok in ("✅", "⚠", "🔒", "●"):
+            raw = raw.replace(tok, "")
+
+        name = raw.strip()
+        if not name:
+            return
+
         self.current_chat_partner = name
         self.unread[name] = 0
+
+        self._load_history_if_needed(name)
         self._flush_security_notices_if_any(name)
         self._refresh_conversation_tile(name)
         self._render_conversation(name)
@@ -2422,6 +2647,27 @@ class ChatApp(ctk.CTk):
         """Đổi lại AES key cho phiên chat hiện tại (GUI-only)."""
         target = self.current_chat_partner
 
+        # Defensive normalize: avoid using UI display text as protocol 'to'
+        raw = (target or "").strip()
+
+        if raw.lower().startswith("peer:"):
+            raw = raw.split(":", 1)[1].strip()
+
+        if raw.startswith("(") and ")" in raw:
+            close = raw.find(")")
+            maybe_n = raw[1:close]
+            if maybe_n.isdigit():
+                raw = raw[close + 1 :].strip()
+
+        for tok in ("✅", "⚠", "🔒", "●"):
+            raw = raw.replace(tok, "")
+
+        target = raw.strip()
+        if target and target != self.current_chat_partner:
+            # Keep internal state consistent too
+            self.current_chat_partner = target
+
+
         if target == "Broadcast":
             self.display_message("[INFO] Không thể Re-key trong phòng Broadcast.")
             return
@@ -2499,6 +2745,145 @@ class ChatApp(ctk.CTk):
             # Session của mình "thắng" - bỏ qua incoming offer
             return False
 
+
+    # ===== Local message store helpers =====
+
+    def _load_history_if_needed(self, peer: str) -> None:
+        """Load decrypted local history into in-memory chat_history once per peer."""
+        try:
+            if not getattr(self, "local_store", None) or not self.local_store.is_unlocked():
+                return
+            conv = peer or "Broadcast"
+            if conv in self._local_store_loaded_peers:
+                return
+
+            # Broadcast is stored under peer="Broadcast"
+            records = self.local_store.load_conversation(conv, limit=800)
+            if conv not in self.chat_history:
+                self.chat_history[conv] = []
+
+            # Convert to UI message dicts
+            for r in records:
+                ts_epoch = int(r.get("ts", 0))
+                dt = datetime.fromtimestamp(ts_epoch) if ts_epoch > 0 else datetime.now()
+                ts_str = dt.strftime("%H:%M")
+                encrypted = bool(r.get("e2ee", False))
+                meta = f"{ts_str}" + (" • 🔒" if encrypted else "")
+                self.chat_history[conv].append({
+                    "kind": "chat",
+                    "direction": "in" if r.get("direction") == "in" else "out",
+                    "text": r.get("text", ""),
+                    "meta": meta,
+                    "msg_id": r.get("id"),
+                    "status": r.get("status", ""),
+                })
+
+            self._local_store_loaded_peers.add(conv)
+        except Exception as e:
+            # Do not spam UI
+            self.log_status(f"[WARN] Cannot load local history for {peer}: {e}", level="WARN")
+
+    def _store_local(self, peer: str, direction: str, text: str, *, e2ee: bool, msg_id: str, ts: int, status: str) -> None:
+        try:
+            if not getattr(self, "local_store", None) or not self.local_store.is_unlocked():
+                return
+            self.local_store.save_message(msg_id=msg_id, peer=peer, direction=direction, ts=int(ts),
+                                          plaintext=text, e2ee=bool(e2ee), status=status)
+        except Exception as e:
+            self.log_status(f"[WARN] Local store save failed: {e}", level="WARN")
+
+    def _store_update_status(self, msg_id: str, status: str) -> None:
+        try:
+            if not getattr(self, "local_store", None) or not self.local_store.is_unlocked():
+                return
+            self.local_store.update_status(msg_id, status)
+        except Exception:
+            pass
+
+    def export_local_store(self) -> None:
+        """Export local history store to a zip archive protected by a passphrase."""
+        if not getattr(self, "local_store", None) or not self.local_store.is_unlocked():
+            messagebox.showerror("Export", "Local store chưa sẵn sàng (chưa đăng nhập hoặc lỗi keystore).")
+            return
+
+        # Choose destination
+        out_path = filedialog.asksaveasfilename(
+            title="Export local chat history",
+            defaultextension=".zip",
+            filetypes=[("SecureChat Export", "*.zip")]
+        )
+        if not out_path:
+            return
+
+        dlg = ctk.CTkInputDialog(text="Nhập passphrase để khóa file export:", title="Export Passphrase")
+        passphrase = dlg.get_input() or ""
+        if not passphrase:
+            messagebox.showerror("Export", "Passphrase không được rỗng.")
+            return
+
+        try:
+            p = self.local_store.export_archive(out_path, passphrase)
+            self.log_status(f"Export thành công: {p}", level="OK")
+            messagebox.showinfo("Export", "Export thành công.")
+        except Exception as e:
+            self.log_status(f"[ERROR] Export thất bại: {e}", level="ERROR")
+            messagebox.showerror("Export", f"Export thất bại: {e}")
+
+    def import_local_store(self) -> None:
+        """
+        Import local history from an export archive.
+
+        Behavior:
+        - OVERWRITE local store on this device (no merge) to avoid duplicated / 'nối' history.
+        - A timestamped backup is created automatically before overwrite.
+        """
+        if not getattr(self, "username", ""):
+            messagebox.showerror("Import", "Bạn cần đăng nhập trước khi import.")
+            return
+
+        zip_path = filedialog.askopenfilename(
+            title="Import local chat history",
+            filetypes=[("SecureChat Export", "*.zip")]
+        )
+        if not zip_path:
+            return
+
+        dlg = ctk.CTkInputDialog(text="Nhập passphrase của file export:", title="Import Passphrase")
+        passphrase = dlg.get_input() or ""
+        if not passphrase:
+            messagebox.showerror("Import", "Passphrase không được rỗng.")
+            return
+
+        # Use the current device key password (same one used to protect private key)
+        device_password = getattr(self, "_key_password", None) or ""
+        if not device_password:
+            messagebox.showerror("Import", "Không có mật khẩu private key trong session (hãy đăng nhập lại).")
+            return
+
+        try:
+            store = self.local_store or LocalMessageStore(self.username)
+            info = store.import_archive(zip_path, passphrase, device_password=device_password)
+
+            # Re-unlock and clear in-memory history
+            self.local_store = store
+            self.local_store.unlock(device_password)
+            self._local_store_loaded_peers = set()
+            self.chat_history = {"Broadcast": []}
+            self.current_chat_partner = "Broadcast"
+            self._ensure_conversation_tile("Broadcast")
+            self._load_history_if_needed("Broadcast")
+            self._render_conversation("Broadcast")
+            self.update_right_panel()
+            self.update_chat_header()
+
+            self.log_status(f"Import thành công (đã thay thế local store). Backup: {info.get('backup_dir','')}", level="OK")
+            messagebox.showinfo("Import", "Import thành công.\nLưu ý: Dữ liệu local trên thiết bị này đã được thay thế (không merge).")
+        except Exception as e:
+            self.log_status(f"[ERROR] Import thất bại: {e}", level="ERROR")
+            messagebox.showerror("Import", f"Import thất bại: {e}")
+
+
 if __name__ == "__main__":
     app = ChatApp()
     app.mainloop()
+    

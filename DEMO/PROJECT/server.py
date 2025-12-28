@@ -478,8 +478,10 @@ def handle_client(sock: socket.socket):
                 encrypted_key_b64 = _pget(m, "encrypted_key_b64")
                 sig_b64 = _pget(m, "sig_b64")
                 ts = _pget(m, "ts")
-                if ts is None:
-                    peer.send_error("Malformed SESSION_OFFER (missing ts)")
+                try:
+                    ts_i = int(ts)
+                except Exception:
+                    peer.send_error("Malformed SESSION_OFFER (ts must be int)")
                     continue
 
                 if not target or not session_id or not encrypted_key_b64 or not sig_b64:
@@ -497,10 +499,16 @@ def handle_client(sock: socket.socket):
                 if not isinstance(session_id, str) or len(session_id) > 128:
                     peer.send_error("Malformed SESSION_OFFER (session_id invalid)")
                     continue
+                
+                try:
+                    ts_i = int(ts)
+                except (TypeError, ValueError):
+                    peer.send_error("Malformed SESSION_OFFER (ts must be int)")
+                    continue
 
                 cs = find_socket_by_name(target)
                 if cs:
-                    ProtoPeer(cs).forward_session_offer(name, session_id, encrypted_key_b64, sig_b64, int(ts))
+                    ProtoPeer(cs).forward_session_offer(name, session_id, encrypted_key_b64, sig_b64, ts_i)
                 else:
                     peer.send_error("User offline")
 
@@ -511,6 +519,15 @@ def handle_client(sock: socket.socket):
 
                 if not target or not session_id or not confirm_hex:
                     peer.send_error("Malformed SESSION_ACK (missing fields)")
+                    continue
+                
+                if (not isinstance(confirm_hex, str)) or (len(confirm_hex) > 128):
+                    peer.send_error("Malformed SESSION_ACK (confirm_hex invalid)")
+                    continue
+                
+                _hex = "0123456789abcdefABCDEF"
+                if any(c not in _hex for c in confirm_hex):
+                    peer.send_error("Malformed SESSION_ACK (confirm_hex must be hex)")
                     continue
 
                 cs = find_socket_by_name(target)

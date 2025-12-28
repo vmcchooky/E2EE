@@ -186,3 +186,32 @@ def session_confirm_token(aes_key: bytes, session_id: str, length: int = 32) -> 
     digest.update(session_id.encode("utf-8"))
     digest.update(b"|SESSION_ACK|v1")
     return digest.finalize().hex()[:length]
+
+
+# ---------------- Local store KDF / HKDF ----------------
+import hashlib
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+def kdf_scrypt(password: str, salt: bytes, length: int = 32,
+               n: int = 2**14, r: int = 8, p: int = 1) -> bytes:
+    """Derive a KEK from a password using scrypt."""
+    if not password:
+        raise ValueError("password must not be empty")
+    if not isinstance(salt, (bytes, bytearray)) or len(salt) < 8:
+        raise ValueError("salt invalid")
+    kdf = Scrypt(salt=bytes(salt), length=int(length), n=int(n), r=int(r), p=int(p))
+    return kdf.derive(password.encode("utf-8"))
+
+def hkdf_conv_key(lsmk: bytes, username: str, peer: str, length: int = 32) -> bytes:
+    """Derive per-conversation at-rest key from LSMK."""
+    if not isinstance(lsmk, (bytes, bytearray)) or len(lsmk) < 16:
+        raise ValueError("lsmk invalid")
+    salt = hashlib.sha256(f"{username}|{peer}".encode("utf-8")).digest()
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=int(length),
+        salt=salt,
+        info=b"SecureChatLocalStore|convkey|v1",
+    )
+    return hkdf.derive(bytes(lsmk))
