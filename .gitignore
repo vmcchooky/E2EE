@@ -1,4 +1,4 @@
-# Top-level ignores
+# Global/editor cruft
 .DS_Store
 Thumbs.db
 *.log
@@ -6,17 +6,24 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+.vs/
+*.pid
 
-# Python / backend
+# Root env files
+.env
+.env.*
+.python-version
+
+# Backend (Python/FastAPI)
 backend/__pycache__/
 backend/**/__pycache__/
 backend/**/*.py[cod]
 backend/.env
 backend/.env.*
-backend/.python-version
 backend/.venv/
 backend/venv/
 backend/env/
+backend/.python-version
 backend/.pytest_cache/
 backend/.mypy_cache/
 backend/.ruff_cache/
@@ -24,8 +31,16 @@ backend/.coverage
 backend/coverage.xml
 backend/htmlcov/
 backend/.tox/
+backend/.pytest_cache/
+backend/.cache/
 
-# Node / frontend
+# DEMO scripts
+DEMO/__pycache__/
+DEMO/**/__pycache__/
+DEMO/**/*.py[cod]
+DEMO/*.pem
+
+# Frontend (Vite/Node)
 frontend/node_modules/
 frontend/.pnpm-store/
 frontend/.npm/
@@ -36,9 +51,21 @@ frontend/.env
 frontend/.env.*
 frontend/.turbo/
 frontend/.next/
+frontend/.eslintcache
+frontend/.stylelintcache
+frontend/.parcel-cache/
+frontend/npm-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+frontend/.cache/
+frontend/.output/
 
-# Local tools
-.env
-.env.*
-.venv/
-venv/
+# OS/installer artifacts
+*.bak
+*.orig
+*.rej
+*.swo
+*.swp
+*.tmp
+*.temp
+*$py.class
